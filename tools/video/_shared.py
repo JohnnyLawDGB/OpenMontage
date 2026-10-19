@@ -12,7 +12,15 @@ from typing import Any
 from tools.base_tool import ToolResult, ToolStatus
 
 
+# HeyGen v3 (POST /v3/models/videos) offers one model, heygen-video-1. The
+# third-party variants below ran on the v1 workflows API (GenerateVideoNode),
+# retired by HeyGen on Oct 31, 2026, with no documented v3 equivalent. They are
+# kept only so old configs get a clear error instead of an unknown-key error.
+HEYGEN_DEFAULT_PROVIDER = "heygen_video_1"
 HEYGEN_PROVIDERS = {
+    "heygen_video_1": {"name": "HeyGen Video 1 (v3)", "quality": "high", "speed": "medium"},
+}
+HEYGEN_LEGACY_PROVIDERS = {
     "veo_3_1": {"name": "Google VEO 3.1", "quality": "highest", "speed": "slow"},
     "veo_3_1_fast": {"name": "Google VEO 3.1 Fast", "quality": "high", "speed": "medium"},
     "veo3": {"name": "Google VEO 3", "quality": "high", "speed": "slow"},
@@ -323,11 +331,20 @@ def generate_local_video(
     )
 
 
-def poll_heygen(execution_id: str, api_key: str, timeout: int = 600) -> str:
+HEYGEN_API_BASE = "https://api.heygen.com"
+HEYGEN_V3_MODEL = "heygen-video-1"
+HEYGEN_TERMINAL_FAILED = {"failed", "cancelled"}
+
+
+def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
+    """Poll GET /v3/models/videos/{video_id} until completed; return video_url.
+
+    v1 /v1/workflows/executions is retired by HeyGen on Oct 31, 2026.
+    """
     import requests
 
     headers = {"X-Api-Key": api_key}
-    url = f"https://api.heygen.com/v1/workflows/executions/{execution_id}"
+    url = f"{HEYGEN_API_BASE}/v3/models/videos/{video_id}"
     deadline = time.time() + timeout
     interval = 5.0
 
@@ -338,21 +355,19 @@ def poll_heygen(execution_id: str, api_key: str, timeout: int = 600) -> str:
         status = data.get("status", "")
 
         if status == "completed":
-            video_url = (
-                data.get("output", {}).get("video", {}).get("video_url")
-                or data.get("output", {}).get("video_url")
-            )
+            video_url = data.get("video_url")
             if video_url:
                 return video_url
-            raise RuntimeError(f"Completed but no video_url in output: {data}")
+            raise RuntimeError(f"Completed but no video_url for {video_id}")
 
-        if status in {"failed", "error"}:
-            raise RuntimeError(f"HeyGen generation failed: {data.get('error', 'Unknown')}")
+        if status in HEYGEN_TERMINAL_FAILED:
+            reason = data.get("failure_message") or data.get("failure_code") or "Unknown"
+            raise RuntimeError(f"HeyGen generation {status}: {reason}")
 
         time.sleep(min(interval, max(0.0, deadline - time.time())))
         interval = min(interval * 1.2, 30.0)
 
-    raise TimeoutError(f"HeyGen execution {execution_id} timed out after {timeout}s")
+    raise TimeoutError(f"HeyGen video {video_id} timed out after {timeout}s")
 
 
 def upload_image_fal(image_path: str) -> str:
@@ -394,10 +409,12 @@ def upload_image_fal(image_path: str) -> str:
     return data["file_url"]
 
 
-def upload_image_heygen(image_path: str, api_key: str) -> str:
-    """Upload a local image to HeyGen and return a public URL.
+def upload_image_heygen(image_path: str, api_key: str) -> dict[str, str]:
+    """Upload a local image with POST /v3/assets (multipart) and return a v3
+    asset input ({"type": "asset_id", "asset_id": ...}).
 
-    Tries the v2 presigned-upload endpoint first, falls back to fal.ai storage.
+    Replaces POST /v2/assets/upload (retired Oct 31, 2026). Falls back to
+    fal.ai storage and returns a URL asset input if the HeyGen upload fails.
     """
     import requests
 
@@ -405,32 +422,22 @@ def upload_image_heygen(image_path: str, api_key: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    # Try HeyGen v2 presigned upload
     try:
-        resp = requests.post(
-            "https://api.heygen.com/v2/assets/upload",
-            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-            json={"content_type": "image/png", "file_name": path.name},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            data = resp.json().get("data", {})
-            upload_url = data.get("upload_url")
-            file_url = data.get("url") or data.get("file_url")
-            if upload_url and file_url:
-                put_resp = requests.put(
-                    upload_url,
-                    headers={"Content-Type": "image/png"},
-                    data=path.read_bytes(),
-                    timeout=60,
-                )
-                put_resp.raise_for_status()
-                return file_url
+        with path.open("rb") as fh:
+            resp = requests.post(
+                f"{HEYGEN_API_BASE}/v3/assets",
+                headers={"X-Api-Key": api_key},
+                files={"file": (path.name, fh)},
+                timeout=60,
+            )
+        if resp.status_code in (200, 201):
+            asset_id = resp.json().get("data", {}).get("asset_id")
+            if asset_id:
+                return {"type": "asset_id", "asset_id": asset_id}
     except Exception:
         pass
 
-    # Fallback to fal.ai storage upload
-    return upload_image_fal(image_path)
+    return {"type": "url", "url": upload_image_fal(image_path)}
 
 
 def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
@@ -440,7 +447,16 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     if not api_key:
         return ToolResult(success=False, error="HEYGEN_API_KEY not set.")
 
-    provider = inputs.get("provider_variant", "veo_3_1")
+    provider = inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER)
+    if provider in HEYGEN_LEGACY_PROVIDERS:
+        return ToolResult(
+            success=False,
+            error=(
+                f"provider_variant {provider} used the HeyGen v1 workflows API, which HeyGen retires on "
+                f"Oct 31, 2026, and has no documented v3 equivalent. Use {HEYGEN_DEFAULT_PROVIDER} "
+                "(POST /v3/models/videos) or another video tool."
+            ),
+        )
     if provider not in HEYGEN_PROVIDERS:
         return ToolResult(
             success=False,
@@ -450,34 +466,41 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     prompt = inputs["prompt"]
     aspect_ratio = inputs.get("aspect_ratio", "16:9")
     operation = inputs.get("operation", "text_to_video")
-    workflow_input: dict[str, Any] = {
-        "prompt": prompt,
-        "provider": provider,
-        "aspect_ratio": aspect_ratio,
-    }
+    body: dict[str, Any] = {"model": HEYGEN_V3_MODEL, "mode": operation, "prompt": prompt}
+    if "duration" in inputs:
+        body["duration"] = int(inputs["duration"])
+    if "resolution" in inputs:
+        body["resolution"] = inputs["resolution"]
     if operation == "image_to_video":
         ref_url = inputs.get("reference_image_url")
         ref_path = inputs.get("reference_image_path")
-        if ref_path and not ref_url:
-            ref_url = upload_image_heygen(ref_path, api_key)
-        if not ref_url:
+        if ref_url:
+            image = {"type": "url", "url": ref_url}
+        elif ref_path:
+            image = upload_image_heygen(ref_path, api_key)
+        else:
             return ToolResult(
                 success=False,
                 error="image_to_video requires reference_image_url or reference_image_path",
             )
-        workflow_input["reference_image_url"] = ref_url
+        body["image"] = image  # image_to_video follows the first frame; no aspect_ratio
+    elif operation == "text_to_video":
+        body["aspect_ratio"] = aspect_ratio
+    else:
+        return ToolResult(success=False, error=f"Unsupported operation: {operation}")
 
     response = requests.post(
-        "https://api.heygen.com/v1/workflows/executions",
+        f"{HEYGEN_API_BASE}/v3/models/videos",
         headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-        json={"workflow_type": "GenerateVideoNode", "input": workflow_input},
+        json=body,
         timeout=30,
     )
     response.raise_for_status()
     payload = response.json()
-    execution_id = payload.get("data", {}).get("execution_id")
-    if not execution_id:
-        return ToolResult(success=False, error=f"No execution_id in response: {payload}")
+    video_id = payload.get("data", {}).get("video_id")
+    if not video_id:
+        return ToolResult(success=False, error="No video_id in HeyGen v3 response")
+    execution_id = video_id  # kept as a result field name for callers
 
     video_url = poll_heygen(execution_id, api_key, timeout=600)
     output_path = Path(inputs.get("output_path", f"heygen_video_{execution_id}.mp4"))

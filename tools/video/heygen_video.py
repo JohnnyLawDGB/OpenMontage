@@ -18,12 +18,12 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
-from tools.video._shared import HEYGEN_PROVIDERS, estimate_quality_cost, estimate_speed_runtime, generate_heygen_video
+from tools.video._shared import HEYGEN_DEFAULT_PROVIDER, HEYGEN_PROVIDERS, estimate_quality_cost, estimate_speed_runtime, generate_heygen_video
 
 
 class HeyGenVideo(BaseTool):
     name = "heygen_video"
-    version = "0.1.0"
+    version = "0.2.0"  # HeyGen API v3 (v1/v2 retired Oct 31, 2026)
     tier = ToolTier.GENERATE
     capability = "video_generation"
     provider = "heygen"
@@ -35,7 +35,7 @@ class HeyGenVideo(BaseTool):
     install_instructions = (
         "Set the HEYGEN_API_KEY environment variable:\n"
         "  set HEYGEN_API_KEY=your_key_here\n"
-        "Get a key at https://app.heygen.com/settings/api"
+        "Get a key at https://platform.heygen.com/api-keys"
     )
     fallback = "wan_video"
     fallback_tools = ["wan_video", "hunyuan_video", "ltx_video_local", "cogvideo_video", "ltx_video_modal", "image_selector"]
@@ -50,7 +50,7 @@ class HeyGenVideo(BaseTool):
     }
     best_for = [
         "premium cloud video generation without local GPU setup",
-        "fast access to VEO, Sora, Kling, Runway, and Seedance providers",
+        "prompt-to-video clips (5-15 s, with audio) on HeyGen Video 1 via the v3 API",
     ]
     not_good_for = [
         "offline or privacy-constrained rendering",
@@ -73,7 +73,7 @@ class HeyGenVideo(BaseTool):
             "provider_variant": {
                 "type": "string",
                 "enum": sorted(HEYGEN_PROVIDERS),
-                "default": "veo_3_1",
+                "default": HEYGEN_DEFAULT_PROVIDER,
             },
             "reference_image_url": {"type": "string"},
             "reference_image_path": {"type": "string"},
@@ -82,6 +82,8 @@ class HeyGenVideo(BaseTool):
                 "enum": ["16:9", "9:16", "1:1"],
                 "default": "16:9",
             },
+            "duration": {"type": "integer", "minimum": 5, "maximum": 15, "default": 5},
+            "resolution": {"type": "string", "enum": ["480p", "768p", "1080p", "2k"], "default": "768p"},
             "output_path": {"type": "string"},
         },
     }
@@ -96,11 +98,11 @@ class HeyGenVideo(BaseTool):
         return ToolStatus.AVAILABLE if os.environ.get("HEYGEN_API_KEY") else ToolStatus.UNAVAILABLE
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", "veo_3_1"), HEYGEN_PROVIDERS["veo_3_1"])
+        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])
         return estimate_quality_cost(meta["quality"])
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
-        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", "veo_3_1"), HEYGEN_PROVIDERS["veo_3_1"])
+        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])
         return estimate_speed_runtime(meta["speed"])
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
