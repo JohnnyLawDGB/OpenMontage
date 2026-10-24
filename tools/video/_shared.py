@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -341,6 +344,81 @@ HEYGEN_V3_MODEL = "heygen-video-1"
 HEYGEN_TERMINAL_FAILED = {"failed", "cancelled"}
 
 
+class HeyGenJobFailed(RuntimeError):
+    """The HeyGen job ended as failed or cancelled (it will not complete)."""
+
+
+# Create-request fields that decide which video a run produces. The local resume
+# key (heygen_idempotency_key) is built from these plus a digest of the reference image.
+HEYGEN_IDEMPOTENCY_FIELDS = [
+    "operation",
+    "prompt",
+    "provider_variant",
+    "aspect_ratio",
+    "duration",
+    "resolution",
+    "reference_image_url",
+    "reference_image_path",
+]
+HEYGEN_JOB_TTL_SECONDS = 24 * 3600  # HeyGen replays an Idempotency-Key for 24 h
+
+
+def heygen_idempotency_key(inputs: dict[str, Any]) -> str:
+    """Stable key for one logical generation request.
+
+    Defaults are filled in so an omitted field and its default match. For a local
+    reference image the file content digest is included, so a changed file at the
+    same path is a different request.
+    """
+    key_data: dict[str, Any] = {k: inputs.get(k) for k in HEYGEN_IDEMPOTENCY_FIELDS}
+    key_data["operation"] = inputs.get("operation", "text_to_video")
+    key_data["provider_variant"] = inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER)
+    key_data["aspect_ratio"] = inputs.get("aspect_ratio", "16:9")
+    ref_path = inputs.get("reference_image_path")
+    if ref_path:
+        try:
+            p = Path(ref_path)
+            if p.is_file() and p.stat().st_size <= HEYGEN_MAX_UPLOAD_BYTES:
+                key_data["reference_image_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+        except OSError:
+            pass
+    raw = json.dumps(key_data, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _heygen_job_path(key: str) -> Path:
+    base = os.environ.get("OPENMONTAGE_HEYGEN_STATE_DIR")
+    root = Path(base).expanduser() if base else Path.home() / ".openmontage" / "heygen_jobs"
+    return root / f"{key}.json"
+
+
+def _load_heygen_job(key: str) -> dict[str, Any] | None:
+    """Saved job for this key, or None if missing, expired or malformed."""
+    try:
+        job = json.loads(_heygen_job_path(key).read_text())
+        if time.time() - float(job["created_at"]) > HEYGEN_JOB_TTL_SECONDS:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job["idempotency_key"]):
+            return None
+        if "video_id" in job:
+            validate_heygen_video_id(job["video_id"])
+        return job
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_heygen_job(key: str, job: dict[str, Any]) -> None:
+    path = _heygen_job_path(key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(job))
+    tmp.replace(path)
+
+
+def _clear_heygen_job(key: str) -> None:
+    _heygen_job_path(key).unlink(missing_ok=True)
+
+
 def validate_heygen_video_id(video_id: Any) -> str:
     """Return video_id if it is a plain token, else raise ValueError.
 
@@ -379,7 +457,7 @@ def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
 
         if status in HEYGEN_TERMINAL_FAILED:
             reason = data.get("failure_message") or data.get("failure_code") or "Unknown"
-            raise RuntimeError(f"HeyGen generation {status}: {reason}")
+            raise HeyGenJobFailed(f"HeyGen generation {status}: {reason}")
 
         time.sleep(min(interval, max(0.0, deadline - time.time())))
         interval = min(interval * 1.2, 30.0)
@@ -604,47 +682,91 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     prompt = inputs["prompt"]
     aspect_ratio = inputs.get("aspect_ratio", "16:9")
     operation = inputs.get("operation", "text_to_video")
-    body: dict[str, Any] = {"model": HEYGEN_V3_MODEL, "mode": operation, "prompt": prompt}
-    if "duration" in inputs:
-        body["duration"] = int(inputs["duration"])
-    if "resolution" in inputs:
-        body["resolution"] = inputs["resolution"]
-    if operation == "image_to_video":
-        ref_url = inputs.get("reference_image_url")
-        ref_path = inputs.get("reference_image_path")
-        if ref_url:
-            image = {"type": "url", "url": ref_url}
-        elif ref_path:
-            image = upload_image_heygen(ref_path, api_key)
-        else:
-            return ToolResult(
-                success=False,
-                error="image_to_video requires reference_image_url or reference_image_path",
-            )
-        body["image"] = image  # image_to_video follows the first frame; no aspect_ratio
-    elif operation == "text_to_video":
-        body["aspect_ratio"] = aspect_ratio
-    else:
+    if operation not in ("text_to_video", "image_to_video"):
         return ToolResult(success=False, error=f"Unsupported operation: {operation}")
+    if operation == "text_to_video" and inputs.get("resolution") in ("1080p", "2k") and aspect_ratio not in ("16:9", "9:16"):
+        return ToolResult(
+            success=False,
+            error=f"HeyGen renders {inputs['resolution']} only in 16:9 or 9:16 for text_to_video, not {aspect_ratio}",
+        )
 
-    response = requests.post(
-        f"{HEYGEN_API_BASE}/v3/models/videos",
-        headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-        json=body,
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    video_id = payload.get("data", {}).get("video_id")
-    if not video_id:
-        return ToolResult(success=False, error="No video_id in HeyGen v3 response")
-    try:
-        validate_heygen_video_id(video_id)  # before the poll URL and the file name
-    except ValueError as exc:
-        return ToolResult(success=False, error=str(exc))
+    # Resume: a job saved for the same request is polled instead of creating (and
+    # billing) a new video. The saved Idempotency-Key also makes a retry after a
+    # timed-out create return the original response.
+    job_key = heygen_idempotency_key(inputs)
+    job = _load_heygen_job(job_key)
+    if job is None:
+        job = {"idempotency_key": uuid.uuid4().hex, "created_at": time.time()}
+        _save_heygen_job(job_key, job)
+    resumed = "video_id" in job
+
+    if resumed:
+        video_id = job["video_id"]
+    else:
+        body: dict[str, Any] = {"model": HEYGEN_V3_MODEL, "mode": operation, "prompt": prompt}
+        if "duration" in inputs:
+            body["duration"] = int(inputs["duration"])
+        if "resolution" in inputs:
+            body["resolution"] = inputs["resolution"]
+        if operation == "image_to_video":
+            ref_url = inputs.get("reference_image_url")
+            ref_path = inputs.get("reference_image_path")
+            if ref_url:
+                image = {"type": "url", "url": ref_url}
+            elif ref_path:
+                image = upload_image_heygen(ref_path, api_key)
+            else:
+                return ToolResult(
+                    success=False,
+                    error="image_to_video requires reference_image_url or reference_image_path",
+                )
+            body["image"] = image  # image_to_video follows the first frame; no aspect_ratio
+        else:
+            body["aspect_ratio"] = aspect_ratio
+
+        try:
+            response = requests.post(
+                f"{HEYGEN_API_BASE}/v3/models/videos",
+                headers={
+                    "X-Api-Key": api_key,
+                    "Content-Type": "application/json",
+                    "Idempotency-Key": job["idempotency_key"],
+                },
+                json=body,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            # A 4xx (not 409) means HeyGen rejected the request, so nothing was billed:
+            # drop the saved key. A timeout or 5xx may have been accepted: keep it.
+            code = getattr(exc.response, "status_code", 0) or 0
+            if 400 <= code < 500 and code != 409:
+                _clear_heygen_job(job_key)
+            raise
+        payload = response.json()
+        video_id = payload.get("data", {}).get("video_id")
+        if not video_id:
+            return ToolResult(success=False, error="No video_id in HeyGen v3 response")
+        try:
+            validate_heygen_video_id(video_id)  # before the poll URL and the file name
+        except ValueError as exc:
+            return ToolResult(success=False, error=str(exc))
+        job["video_id"] = video_id
+        _save_heygen_job(job_key, job)  # before polling, so a re-run resumes this id
     execution_id = video_id  # kept as a result field name for callers
 
-    video_url = poll_heygen(execution_id, api_key, timeout=600)
+    try:
+        video_url = poll_heygen(execution_id, api_key, timeout=600)
+    except HeyGenJobFailed:
+        _clear_heygen_job(job_key)  # a failed job is not resumable; the next run starts fresh
+        raise
+    except requests.HTTPError as exc:
+        if resumed and getattr(exc.response, "status_code", 0) == 404:
+            _clear_heygen_job(job_key)
+            raise RuntimeError(
+                f"Saved HeyGen job {execution_id} no longer exists; cleared it, run again to start a new generation"
+            ) from exc
+        raise
     output_path = Path(inputs.get("output_path", f"heygen_video_{execution_id}.mp4"))
     download_heygen_video(video_url, output_path)
 
@@ -660,6 +782,7 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
             "aspect_ratio": aspect_ratio,
             "operation": operation,
             "execution_id": execution_id,
+            "resumed": resumed,
             "output": str(output_path),
             "format": "mp4",
         },

@@ -11,6 +11,7 @@ from tools.base_tool import (
     Determinism,
     ExecutionMode,
     ResourceProfile,
+    ResumeSupport,
     RetryPolicy,
     ToolResult,
     ToolRuntime,
@@ -18,7 +19,15 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
-from tools.video._shared import HEYGEN_DEFAULT_PROVIDER, HEYGEN_PROVIDERS, estimate_quality_cost, estimate_speed_runtime, generate_heygen_video
+from tools.video._shared import (
+    HEYGEN_DEFAULT_PROVIDER,
+    HEYGEN_IDEMPOTENCY_FIELDS,
+    HEYGEN_PROVIDERS,
+    estimate_quality_cost,
+    estimate_speed_runtime,
+    generate_heygen_video,
+    heygen_idempotency_key,
+)
 
 
 class HeyGenVideo(BaseTool):
@@ -90,12 +99,17 @@ class HeyGenVideo(BaseTool):
 
     resource_profile = ResourceProfile(cpu_cores=1, ram_mb=512, vram_mb=0, disk_mb=500, network_required=True)
     retry_policy = RetryPolicy(max_retries=2, backoff_seconds=10.0, retryable_errors=["rate_limit", "timeout", "server_error"])
-    idempotency_key_fields = ["prompt", "provider_variant", "aspect_ratio"]
+    resume_support = ResumeSupport.FROM_CHECKPOINT  # saved video_id is polled again instead of re-creating
+    idempotency_key_fields = list(HEYGEN_IDEMPOTENCY_FIELDS)
     side_effects = ["writes video file to output_path", "calls HeyGen API"]
     user_visible_verification = ["Watch generated clip for motion quality and prompt adherence"]
 
     def get_status(self) -> ToolStatus:
         return ToolStatus.AVAILABLE if os.environ.get("HEYGEN_API_KEY") else ToolStatus.UNAVAILABLE
+
+    def idempotency_key(self, inputs: dict[str, Any]) -> str:
+        # Adds a digest of the reference image file; generate_heygen_video uses the same key to resume.
+        return heygen_idempotency_key(inputs)
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])
@@ -114,6 +128,6 @@ class HeyGenVideo(BaseTool):
         except Exception as exc:
             return ToolResult(success=False, error=f"HeyGen video generation failed: {exc}")
         result.duration_seconds = round(time.time() - start, 2)
-        result.cost_usd = self.estimate_cost(inputs)
+        result.cost_usd = 0.0 if (result.data or {}).get("resumed") else self.estimate_cost(inputs)
         return result
 

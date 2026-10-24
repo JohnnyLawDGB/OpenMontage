@@ -5,10 +5,16 @@ type checks, H4 idempotency and resume. requests.get / post / put are patched.
 """
 from __future__ import annotations
 
+import json
+import re
+import time
+
 import pytest
+import requests
 from requests.structures import CaseInsensitiveDict
 
 from tools.video import _shared
+from tools.video.heygen_video import HeyGenVideo
 
 GOOD_URL = "https://resource2.heygen.ai/v/clip.mp4"
 
@@ -24,7 +30,7 @@ class Resp:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f"HTTP {self.status_code}")
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def iter_content(self, chunk_size=1):
         yield from self._chunks
@@ -315,3 +321,179 @@ def test_h3_image_to_video_flow_refuses_outside_path(flow, assets):
         _shared.generate_heygen_video({"prompt": "p", "operation": "image_to_video",
                                        "reference_image_path": str(secret)})
     assert flow.log == []
+
+
+# ---------------------------------------------------------------- H4
+
+def _creates(flow):
+    return [c for c in flow.log if c[0] == "POST" and c[1].endswith("/v3/models/videos")]
+
+
+def _run(flow, **inputs):
+    return _shared.generate_heygen_video({"prompt": "same prompt", "output_path": str(flow.tmp / "o.mp4"), **inputs})
+
+
+def test_h4_key_fields_cover_the_create_request():
+    fields = HeyGenVideo.idempotency_key_fields
+    for f in ("operation", "prompt", "provider_variant", "aspect_ratio", "duration", "resolution",
+              "reference_image_url", "reference_image_path"):
+        assert f in fields
+
+
+def test_h4_extra_a_key_changes_with_every_field():
+    base = {"prompt": "p", "operation": "image_to_video", "reference_image_url": "https://x.example/a.png",
+            "duration": 5, "resolution": "768p", "aspect_ratio": "16:9"}
+    k = HeyGenVideo().idempotency_key
+    assert k(base) == k(dict(base))
+    for field, other in [("operation", "text_to_video"), ("duration", 10), ("resolution", "480p"),
+                         ("aspect_ratio", "9:16"), ("prompt", "q"),
+                         ("reference_image_url", "https://x.example/b.png")]:
+        assert k({**base, field: other}) != k(base), field
+    # omitted defaults match explicit defaults
+    assert k({"prompt": "p"}) == k({"prompt": "p", "operation": "text_to_video",
+                                    "provider_variant": "heygen_video_1", "aspect_ratio": "16:9"})
+    assert HeyGenVideo().idempotency_key(base) == _shared.heygen_idempotency_key(base)
+
+
+def test_h4_extra_a_reference_image_content_and_path_change_the_key(tmp_path):
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    a.write_bytes(PNG + b"A")
+    b.write_bytes(PNG + b"B")
+    k = HeyGenVideo().idempotency_key
+    inp = {"prompt": "p", "operation": "image_to_video"}
+    ka = k({**inp, "reference_image_path": str(a)})
+    assert ka != k({**inp, "reference_image_path": str(b)})
+    a.write_bytes(PNG + b"changed")           # same path, new content
+    assert ka != k({**inp, "reference_image_path": str(a)})
+
+
+def test_h4_extra_a_two_image_runs_same_prompt_never_resume_the_wrong_video(flow, assets):
+    a, b = assets / "a.png", assets / "b.png"
+    a.write_bytes(PNG + b"A")
+    b.write_bytes(PNG + b"B")
+    flow.create_id = "vid_A"
+    r1 = _run(flow, operation="image_to_video", reference_image_path=str(a))
+    flow.create_id = "vid_B"
+    r2 = _run(flow, operation="image_to_video", reference_image_path=str(b))
+    assert r1.data["execution_id"] == "vid_A" and not r1.data["resumed"]
+    assert r2.data["execution_id"] == "vid_B" and not r2.data["resumed"]
+    assert len(_creates(flow)) == 2
+    # and the same image again resumes its own video, not the other one
+    flow.create_id = "vid_C"
+    r3 = _run(flow, operation="image_to_video", reference_image_path=str(a))
+    assert r3.data["execution_id"] == "vid_A" and r3.data["resumed"] and len(_creates(flow)) == 2
+
+
+def test_h4_rerun_after_timeout_resumes_and_does_not_create_again(flow, monkeypatch):
+    real_poll = _shared.poll_heygen
+    calls = []
+
+    def poll(video_id, api_key, timeout=600):
+        calls.append(video_id)
+        if len(calls) == 1:
+            raise TimeoutError("timed out")
+        return real_poll(video_id, api_key, timeout)
+
+    monkeypatch.setattr(_shared, "poll_heygen", poll)
+    with pytest.raises(TimeoutError):
+        _run(flow)
+    out = _run(flow)
+    assert out.success and out.data["resumed"] and out.data["execution_id"] == "vid_1"
+    assert len(_creates(flow)) == 1 and calls == ["vid_1", "vid_1"]
+
+
+def test_h4_rerun_after_success_does_not_bill_again(flow, monkeypatch):
+    monkeypatch.setenv("OPENMONTAGE_HEYGEN_STATE_DIR", str(flow.tmp / "state"))
+    first = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.tmp / "o.mp4")})
+    second = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.tmp / "o2.mp4")})
+    assert first.success and second.success
+    assert first.cost_usd > 0 and second.cost_usd == 0.0 and second.data["resumed"]
+    assert len(_creates(flow)) == 1 and (flow.tmp / "o2.mp4").read_bytes() == b"MP4"
+
+
+def test_h4_video_id_is_saved_before_polling(flow, monkeypatch):
+    monkeypatch.setattr(_shared, "poll_heygen", lambda *a, **k: (_ for _ in ()).throw(TimeoutError("t")))
+    with pytest.raises(TimeoutError):
+        _run(flow)
+    saved = [json.loads(p.read_text()) for p in (flow.tmp / "state").glob("*.json")]
+    assert len(saved) == 1 and saved[0]["video_id"] == "vid_1"
+
+
+def test_h4_create_sends_idempotency_key_and_reuses_it_after_a_timed_out_create(flow, monkeypatch):
+    real_post = requests.post
+    state = {"n": 0}
+
+    def post(url, **kw):
+        if url.endswith("/v3/models/videos"):
+            state["n"] += 1
+            if state["n"] == 1:
+                flow.log.append(("POST", url, kw))
+                raise requests.ConnectionError("read timed out")  # accepted by HeyGen, reply lost
+        return real_post(url, **kw)
+
+    monkeypatch.setattr("requests.post", post)
+    # real_post is the flow's mock, captured before this patch replaced it
+    with pytest.raises(requests.ConnectionError):
+        _run(flow)
+    out = _run(flow)
+    assert out.success
+    h1, h2 = (c[2]["headers"]["Idempotency-Key"] for c in _creates(flow))
+    assert h1 == h2 and re.fullmatch(r"[A-Za-z0-9_-]{1,255}", h1)
+
+
+def test_h4_failed_job_is_not_resumed_and_gets_a_new_key(flow):
+    flow.poll = {"status": "failed", "failure_code": "generation_failed"}
+    with pytest.raises(RuntimeError, match="generation_failed"):
+        _run(flow)
+    flow.poll = {"status": "completed"}
+    flow.create_id = "vid_2"
+    out = _run(flow)
+    assert out.data["execution_id"] == "vid_2" and not out.data["resumed"]
+    h1, h2 = (c[2]["headers"]["Idempotency-Key"] for c in _creates(flow))
+    assert h1 != h2
+
+
+def test_h4_rejected_create_drops_the_saved_key(flow, monkeypatch):
+    seen = []
+
+    def post(url, **kw):
+        flow.log.append(("POST", url, kw))
+        seen.append(kw["headers"]["Idempotency-Key"])
+        return Resp({}, status=400) if len(seen) == 1 else Resp({"data": {"video_id": "vid_1"}}, status=202)
+
+    monkeypatch.setattr("requests.post", post)
+    with pytest.raises(requests.HTTPError):
+        _run(flow)
+    assert _run(flow).success
+    assert seen[0] != seen[1]
+
+
+def test_h4_saved_job_with_bad_id_or_expired_is_ignored(flow):
+    key = _shared.heygen_idempotency_key({"prompt": "same prompt"})
+    path = _shared._heygen_job_path(key)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"idempotency_key": "abc", "video_id": "../../x", "created_at": time.time()}))
+    assert _run(flow).data["resumed"] is False
+    path.write_text(json.dumps({"idempotency_key": "abc", "video_id": "vid_old",
+                                "created_at": time.time() - _shared.HEYGEN_JOB_TTL_SECONDS - 5}))
+    out = _run(flow)
+    assert out.data["resumed"] is False and out.data["execution_id"] == "vid_1"
+    path.write_text("not json")
+    assert _run(flow).data["resumed"] is False
+
+
+def test_h4_resumed_job_that_no_longer_exists_is_cleared(flow, monkeypatch):
+    key = _shared.heygen_idempotency_key({"prompt": "same prompt"})
+    _shared._save_heygen_job(key, {"idempotency_key": "abc", "video_id": "gone", "created_at": time.time()})
+    monkeypatch.setattr("requests.get", lambda url, **kw: Resp({}, status=404))
+    with pytest.raises(RuntimeError, match="no longer exists"):
+        _run(flow)
+    assert _shared._load_heygen_job(key) is None and _creates(flow) == []
+
+
+@pytest.mark.parametrize("res", ["1080p", "2k"])
+def test_h4_square_text_to_video_at_1080p_or_2k_is_rejected_before_any_call(flow, res):
+    out = _run(flow, aspect_ratio="1:1", resolution=res)
+    assert not out.success and "16:9 or 9:16" in out.error and flow.log == []
+    assert _run(flow, aspect_ratio="9:16", resolution=res).success
+    assert _run(flow, aspect_ratio="1:1", resolution="768p").success
