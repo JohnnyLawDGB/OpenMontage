@@ -338,6 +338,17 @@ HEYGEN_V3_MODEL = "heygen-video-1"
 HEYGEN_TERMINAL_FAILED = {"failed", "cancelled"}
 
 
+def validate_heygen_video_id(video_id: Any) -> str:
+    """Return video_id if it is a plain token, else raise ValueError.
+
+    The id comes from HeyGen's response and is used in the poll URL path and in
+    the default output file name, so it must not carry slashes, dots or spaces.
+    """
+    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+        raise ValueError("Invalid video_id in HeyGen response (expected [A-Za-z0-9_-]{1,64})")
+    return video_id
+
+
 def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
     """Poll GET /v3/models/videos/{video_id} until completed; return video_url.
 
@@ -345,6 +356,7 @@ def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
     """
     import requests
 
+    validate_heygen_video_id(video_id)
     headers = {"X-Api-Key": api_key}
     url = f"{HEYGEN_API_BASE}/v3/models/videos/{video_id}"
     deadline = time.time() + timeout
@@ -570,6 +582,10 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     video_id = payload.get("data", {}).get("video_id")
     if not video_id:
         return ToolResult(success=False, error="No video_id in HeyGen v3 response")
+    try:
+        validate_heygen_video_id(video_id)  # before the poll URL and the file name
+    except ValueError as exc:
+        return ToolResult(success=False, error=str(exc))
     execution_id = video_id  # kept as a result field name for callers
 
     video_url = poll_heygen(execution_id, api_key, timeout=600)

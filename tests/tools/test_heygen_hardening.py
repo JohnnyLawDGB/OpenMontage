@@ -157,3 +157,44 @@ def test_h1_flow_refuses_internal_video_url(flow):
         _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.tmp / "o.mp4")})
     assert not (flow.tmp / "o.mp4").exists()
     assert not any(c[1].startswith("http://169") for c in flow.log)
+
+
+# ---------------------------------------------------------------- H2
+
+BAD_IDS = ["../../escaped", "a/b", "a b", "a.b", "a\nb", "ok\n", "", "x" * 65, "vid;rm", "%2e%2e", "vid?x=1", 12345, ["a"]]
+
+
+@pytest.mark.parametrize("vid", ["a", "vid_1", "A-b_9", "x" * 64])
+def test_h2_valid_ids_pass(vid):
+    assert _shared.validate_heygen_video_id(vid) == vid
+
+
+@pytest.mark.parametrize("vid", BAD_IDS)
+def test_h2_invalid_ids_rejected(vid):
+    with pytest.raises(ValueError):
+        _shared.validate_heygen_video_id(vid)
+
+
+@pytest.mark.parametrize("vid", [b for b in BAD_IDS if b])
+def test_h2_extra_b_create_response_id_checked_before_poll_and_filename(flow, vid):
+    """Extra (b): rejected right after create; no GET poll URL, no file written."""
+    flow.create_id = vid
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.tmp / "o.mp4")})
+    assert not out.success and "video_id" in out.error
+    assert [c for c in flow.log if c[0] == "GET"] == []
+    assert [c for c in flow.log if c[0] == "POST"][0][1].endswith("/v3/models/videos")
+    assert list(flow.tmp.glob("**/*.mp4")) == []
+
+
+def test_h2_poll_heygen_refuses_bad_id_without_request(flow):
+    with pytest.raises(ValueError):
+        _shared.poll_heygen("../../x", "k", timeout=5)
+    assert flow.log == []
+
+
+def test_h2_default_filename_uses_validated_id(flow, monkeypatch):
+    monkeypatch.chdir(flow.tmp)
+    out = _shared.generate_heygen_video({"prompt": "p"})
+    assert out.success, out.error
+    assert out.artifacts == ["heygen_video_vid_1.mp4"]
+    assert (flow.tmp / "heygen_video_vid_1.mp4").read_bytes() == b"MP4"
