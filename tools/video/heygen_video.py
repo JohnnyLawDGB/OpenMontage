@@ -23,7 +23,7 @@ from tools.video._shared import (
     HEYGEN_DEFAULT_PROVIDER,
     HEYGEN_IDEMPOTENCY_FIELDS,
     HEYGEN_PROVIDERS,
-    estimate_quality_cost,
+    estimate_heygen_cost,
     estimate_speed_runtime,
     generate_heygen_video,
     heygen_idempotency_key,
@@ -114,7 +114,7 @@ class HeyGenVideo(BaseTool):
 
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
         meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])
-        return estimate_quality_cost(meta["quality"])
+        return estimate_heygen_cost(meta["quality"], inputs.get("resolution"))
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
         meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])

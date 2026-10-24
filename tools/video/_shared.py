@@ -186,6 +186,11 @@ def local_install_instructions() -> str:
     )
 
 
+def estimate_heygen_cost(quality: str, resolution: str | None = None) -> float:
+    """Quality-tier estimate, 3x for 1080p and 2k (HeyGen bills those at 3x the 768p rate)."""
+    return estimate_quality_cost(quality) * (3 if resolution in ("1080p", "2k") else 1)
+
+
 def estimate_quality_cost(quality: str) -> float:
     if quality == "highest":
         return 0.50
@@ -363,6 +368,8 @@ HEYGEN_IDEMPOTENCY_FIELDS = [
     "reference_image_url",
     "reference_image_path",
 ]
+HEYGEN_DEFAULT_DURATION = 5  # HeyGen defaults, used only so an omitted field and its default share one key
+HEYGEN_DEFAULT_RESOLUTION = "768p"
 HEYGEN_JOB_TTL_SECONDS = 24 * 3600  # HeyGen replays an Idempotency-Key for 24 h
 
 
@@ -377,13 +384,17 @@ def heygen_idempotency_key(inputs: dict[str, Any]) -> str:
     key_data["operation"] = inputs.get("operation", "text_to_video")
     key_data["provider_variant"] = inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER)
     key_data["aspect_ratio"] = inputs.get("aspect_ratio", "16:9")
+    key_data["duration"] = inputs.get("duration", HEYGEN_DEFAULT_DURATION)
+    key_data["resolution"] = inputs.get("resolution", HEYGEN_DEFAULT_RESOLUTION)
     ref_path = inputs.get("reference_image_path")
     if ref_path:
         try:
-            p = Path(ref_path)
-            if p.is_file() and p.stat().st_size <= HEYGEN_MAX_UPLOAD_BYTES:
+            p = Path(ref_path).resolve()  # relative and absolute spellings of one file match
+            key_data["reference_image_path"] = str(p)
+            # Hash only files inside the allowed roots: the upload would refuse any other path.
+            if any(p.is_relative_to(r) for r in _allowed_asset_roots()) and p.is_file() and p.stat().st_size <= HEYGEN_MAX_UPLOAD_BYTES:
                 key_data["reference_image_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
-        except OSError:
+        except (OSError, RuntimeError):
             pass
     raw = json.dumps(key_data, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 
 import pytest
 import requests
@@ -361,8 +362,8 @@ def test_h4_extra_a_key_changes_with_every_field():
     assert HeyGenVideo().idempotency_key(base) == _shared.heygen_idempotency_key(base)
 
 
-def test_h4_extra_a_reference_image_content_and_path_change_the_key(tmp_path):
-    a, b = tmp_path / "a.png", tmp_path / "b.png"
+def test_h4_extra_a_reference_image_content_and_path_change_the_key(assets):
+    a, b = assets / "a.png", assets / "b.png"
     a.write_bytes(PNG + b"A")
     b.write_bytes(PNG + b"B")
     k = HeyGenVideo().idempotency_key
@@ -1155,3 +1156,48 @@ def test_f8_overall_deadline_stops_a_slow_download(monkeypatch, tmp_path):
 
 def test_f8_deadline_default_is_fifteen_minutes():
     assert _shared.HEYGEN_DOWNLOAD_DEADLINE_SECONDS == 15 * 60
+
+
+# ------------------------------------------------ Low F11/F12: key defaults, ref path, cost estimate
+
+def test_f11_omitted_duration_and_resolution_match_their_defaults():
+    a = _shared.heygen_idempotency_key({"prompt": "p"})
+    assert a == _shared.heygen_idempotency_key({"prompt": "p", "duration": 5, "resolution": "768p"})
+    assert a != _shared.heygen_idempotency_key({"prompt": "p", "duration": 6})
+    assert a != _shared.heygen_idempotency_key({"prompt": "p", "resolution": "1080p"})
+
+
+def test_f11_relative_and_absolute_ref_path_share_a_key(assets, monkeypatch):
+    (assets / "a.png").write_bytes(PNG)
+    monkeypatch.chdir(assets)
+    base = {"operation": "image_to_video", "prompt": "p"}
+    assert _shared.heygen_idempotency_key({**base, "reference_image_path": "a.png"}) == \
+        _shared.heygen_idempotency_key({**base, "reference_image_path": str(assets / "a.png")})
+
+
+def test_f11_files_outside_the_roots_are_not_read_for_the_digest(flow, monkeypatch):
+    outside = flow.tmp / "secret.png"
+    outside.write_bytes(PNG)
+    read = []
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda self: (read.append(self), real(self))[1])
+    _shared.heygen_idempotency_key({"operation": "image_to_video", "prompt": "p", "reference_image_path": str(outside)})
+    assert read == []
+
+
+def test_f11_changed_image_content_changes_the_key(assets):
+    p = assets / "a.png"
+    inputs = {"operation": "image_to_video", "prompt": "p", "reference_image_path": str(p)}
+    p.write_bytes(PNG)
+    k1 = _shared.heygen_idempotency_key(inputs)
+    p.write_bytes(PNG + b"1")
+    assert k1 != _shared.heygen_idempotency_key(inputs)
+
+
+@pytest.mark.parametrize("res,factor", [(None, 1), ("768p", 1), ("720p", 1), ("1080p", 3), ("2k", 3)])
+def test_f12_estimate_cost_is_3x_for_1080p_and_2k(res, factor):
+    tool = HeyGenVideo()
+    base = tool.estimate_cost({"prompt": "p"})
+    inputs = {"prompt": "p", **({"resolution": res} if res else {})}
+    assert tool.estimate_cost(inputs) == pytest.approx(base * factor)
+    assert base > 0
