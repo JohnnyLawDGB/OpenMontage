@@ -18,6 +18,8 @@ from requests.structures import CaseInsensitiveDict
 from tools.video import _shared
 from tools.video.heygen_video import HeyGenVideo
 
+_REAL_UPLOAD_IMAGE_FAL = _shared.upload_image_fal
+
 GOOD_URL = "https://resource2.heygen.ai/v/clip.mp4"
 _REAL_SLEEP = time.sleep   # the flow fixture replaces time.sleep with a no-op
 MP4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 20   # an mp4 header: bytes 4-8 are ftyp
@@ -1271,3 +1273,99 @@ def test_fa_reference_url_check_is_pure_syntax_no_dns(monkeypatch):
     import socket
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: pytest.fail("no DNS lookups"))
     assert _shared._reference_url_ok("https://images.shopfront.com/a.png")
+
+
+# ------------------------------------------------ Follow-up (b): fal.ai upload from video_selector is opt-in
+
+class _FakeProvider:
+    name, provider = "fake_video", "fake"
+
+    def __init__(self, image_url_prop=True):
+        props = {"prompt": {}, "image_url": {}} if image_url_prop else {"prompt": {}, "reference_image_path": {}}
+        self.input_schema = {"properties": props}
+        self.seen = []
+
+    def get_info(self):
+        return {}
+
+    def execute(self, inputs):
+        from tools.base_tool import ToolResult
+        self.seen.append(dict(inputs))
+        return ToolResult(success=True, data={})
+
+
+@pytest.fixture
+def selector(monkeypatch, assets):
+    from tools.video.video_selector import VideoSelector
+    provider = _FakeProvider()
+    sel = VideoSelector()
+    monkeypatch.setattr(sel, "_providers", lambda: [provider])
+    monkeypatch.setattr(sel, "_prepare_task_context", lambda inputs: {})
+    monkeypatch.setattr(sel, "_select_best_tool", lambda inputs, c, ctx: (provider, None))
+    monkeypatch.delenv("OPENMONTAGE_ALLOW_FAL_UPLOAD", raising=False)
+    monkeypatch.setenv("FAL_KEY", "test-not-a-fal-key")
+    img = assets / "ref.png"
+    img.write_bytes(PNG)
+    uploads = []
+
+    def fake_upload(path):
+        uploads.append(path)
+        return "https://fal.example/f.png"
+
+    monkeypatch.setattr(_shared, "upload_image_fal", fake_upload)
+    return sel, provider, img, uploads
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "true", "yes", "2", " 1"])
+def test_fb_upload_is_off_unless_exactly_1(selector, monkeypatch, value):
+    sel, provider, img, uploads = selector
+    if value is not None:
+        monkeypatch.setenv("OPENMONTAGE_ALLOW_FAL_UPLOAD", value)
+    out = sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(img)})
+    assert not out.success and "OPENMONTAGE_ALLOW_FAL_UPLOAD=1" in out.error
+    assert uploads == [] and provider.seen == []
+
+
+def test_fb_opt_in_uploads_and_logs_the_file_name_but_no_key(selector, monkeypatch, caplog):
+    sel, provider, img, uploads = selector
+    monkeypatch.setenv("OPENMONTAGE_ALLOW_FAL_UPLOAD", "1")
+    with caplog.at_level("WARNING"):
+        out = sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(img)})
+    assert out.success, out.error
+    assert uploads == [str(img)] and provider.seen[0]["image_url"] == "https://fal.example/f.png"
+    assert "ref.png" in caplog.text and "public fal.ai" in caplog.text
+    assert "test-not-a-fal-key" not in caplog.text and str(img.parent) not in caplog.text
+
+
+def test_fb_gate_does_not_affect_providers_that_take_a_path_or_an_image_url(selector, monkeypatch):
+    sel, provider, img, uploads = selector
+    path_provider = _FakeProvider(image_url_prop=False)
+    monkeypatch.setattr(sel, "_select_best_tool", lambda inputs, c, ctx: (path_provider, None))
+    assert sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(img)}).success
+    monkeypatch.setattr(sel, "_select_best_tool", lambda inputs, c, ctx: (provider, None))
+    assert sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(img),
+                        "image_url": "https://images.shopfront.com/a.png"}).success
+    assert uploads == []
+
+
+def test_fb_upload_failure_message_has_no_url(selector, monkeypatch):
+    sel, provider, img, uploads = selector
+    monkeypatch.setenv("OPENMONTAGE_ALLOW_FAL_UPLOAD", "1")
+
+    def boom(path):
+        raise RuntimeError("PUT https://fal.example/put?X-Amz-Signature=SECRETSIG failed")
+
+    monkeypatch.setattr(_shared, "upload_image_fal", boom)
+    out = sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(img)})
+    assert not out.success and "SECRETSIG" not in out.error and "https://" not in out.error
+
+
+def test_fb_opt_in_still_runs_the_path_validation(selector, monkeypatch, flow):
+    sel, provider, img, uploads = selector
+    monkeypatch.setattr(_shared, "upload_image_fal", _REAL_UPLOAD_IMAGE_FAL)   # real checks, mocked HTTP
+    monkeypatch.setenv("OPENMONTAGE_ALLOW_FAL_UPLOAD", "1")
+    outside = flow.tmp / "x.png"
+    outside.write_bytes(PNG)
+    monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("no request expected"))
+    out = sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(outside)})
+    assert not out.success and "outside" in out.error and provider.seen == []

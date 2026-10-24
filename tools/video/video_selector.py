@@ -7,9 +7,13 @@ the tool file in tools/video/; no changes to this selector are needed.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from tools.base_tool import BaseTool, ToolResult, ToolRuntime, ToolStability, ToolStatus, ToolTier
+
+
+logger = logging.getLogger(__name__)
 
 
 class VideoSelector(BaseTool):
@@ -169,11 +173,28 @@ class VideoSelector(BaseTool):
             tool_props = getattr(tool, "input_schema", {}).get("properties", {})
             # If the provider uses image_url (not reference_image_path), upload and convert
             if "image_url" in tool_props and "image_url" not in adapted:
+                # The upload goes to PUBLIC fal.ai storage, so it is off unless the operator opts in.
+                if os.environ.get("OPENMONTAGE_ALLOW_FAL_UPLOAD") != "1":
+                    return ToolResult(
+                        success=False,
+                        error=(
+                            f"{tool.name} needs a public image_url, and the local reference image would have to be "
+                            "uploaded to public fal.ai storage. That is off by default: set "
+                            "OPENMONTAGE_ALLOW_FAL_UPLOAD=1 to allow it, pass image_url yourself, or pick a "
+                            "provider that takes reference_image_path."
+                        ),
+                    )
                 try:
                     from tools.video._shared import upload_image_fal
+                    logger.warning(
+                        "Uploading %s to public fal.ai storage for %s (OPENMONTAGE_ALLOW_FAL_UPLOAD=1)",
+                        os.path.basename(str(adapted["reference_image_path"])),
+                        tool.name,
+                    )
                     adapted["image_url"] = upload_image_fal(adapted["reference_image_path"])
                 except Exception as e:
-                    return ToolResult(success=False, error=f"Failed to upload reference image: {e}")
+                    from tools.video._shared import scrub_urls
+                    return ToolResult(success=False, error=f"Failed to upload reference image: {scrub_urls(str(e))}")
 
         result = tool.execute(adapted)
         if result.success:
