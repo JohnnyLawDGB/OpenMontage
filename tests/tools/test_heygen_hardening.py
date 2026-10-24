@@ -17,10 +17,12 @@ from tools.video import _shared
 from tools.video.heygen_video import HeyGenVideo
 
 GOOD_URL = "https://resource2.heygen.ai/v/clip.mp4"
+_REAL_SLEEP = time.sleep   # the flow fixture replaces time.sleep with a no-op
+MP4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 20   # an mp4 header: bytes 4-8 are ftyp
 
 
 class Resp:
-    def __init__(self, payload=None, status=200, chunks=(b"MP4",), headers=None):
+    def __init__(self, payload=None, status=200, chunks=(MP4,), headers=None):
         self._p, self.status_code, self._chunks = payload or {}, status, list(chunks)
         self.headers = CaseInsensitiveDict(headers or {})
         self.closed = False
@@ -67,7 +69,7 @@ def flow(monkeypatch, tmp_path):
         f.log.append(("GET", url, kw))
         if url.startswith("https://api.heygen.com/"):
             return Resp({"data": {**f.poll, "video_url": f.video_url}})
-        return Resp(chunks=[b"MP4"])
+        return Resp(chunks=[MP4])
 
     monkeypatch.setattr("requests.post", post)
     monkeypatch.setattr("requests.get", get)
@@ -206,7 +208,7 @@ def test_h2_default_filename_uses_validated_id(flow, monkeypatch):
     out = _shared.generate_heygen_video({"prompt": "p"})
     assert out.success, out.error
     assert out.artifacts == ["heygen_video_vid_1.mp4"]
-    assert (flow.tmp / "heygen_video_vid_1.mp4").read_bytes() == b"MP4"
+    assert (flow.tmp / "heygen_video_vid_1.mp4").read_bytes() == MP4
 
 
 # ---------------------------------------------------------------- H3
@@ -411,7 +413,7 @@ def test_h4_rerun_after_success_does_not_bill_again(flow, monkeypatch):
     second = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.tmp / "o2.mp4")})
     assert first.success and second.success
     assert first.cost_usd > 0 and second.cost_usd == 0.0 and second.data["resumed"]
-    assert len(_creates(flow)) == 1 and (flow.tmp / "o2.mp4").read_bytes() == b"MP4"
+    assert len(_creates(flow)) == 1 and (flow.tmp / "o2.mp4").read_bytes() == MP4
 
 
 def test_h4_video_id_is_saved_before_polling(flow, monkeypatch):
@@ -685,3 +687,163 @@ def test_f2_tool_result_scrubs_urls_from_any_exception(flow, monkeypatch):
 ])
 def test_f2_scrub_urls(text):
     _assert_clean(_shared.scrub_urls(text))
+
+
+# ------------------------------------------------ Security flag F3: concurrency, temp files, modes
+
+import os
+import stat
+import threading
+
+
+def _slow_create(flow, monkeypatch, delay=0.2, counter_file=None):
+    """Make the create call slow so concurrent runs overlap; count creates."""
+    real_post = requests.post
+
+    def post(url, **kw):
+        if url.endswith("/v3/models/videos"):
+            if counter_file is not None:
+                with open(counter_file, "a") as fh:
+                    fh.write(kw["headers"]["Idempotency-Key"] + "\n")
+            _REAL_SLEEP(delay)
+        return real_post(url, **kw)
+
+    monkeypatch.setattr("requests.post", post)
+
+
+def test_f3_threads_same_key_create_exactly_one_video(flow, monkeypatch):
+    _slow_create(flow, monkeypatch)
+    results, errors = [], []
+    barrier = threading.Barrier(5)
+
+    def worker(i):
+        try:
+            barrier.wait()
+            results.append(_run(flow, output_path=str(flow.out / f"o{i}.mp4")))
+        except Exception as exc:  # pragma: no cover - failure path is asserted below
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(5)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errors == []
+    assert len(_creates(flow)) == 1
+    assert {r.data["execution_id"] for r in results} == {"vid_1"}
+    assert sorted(r.data["resumed"] for r in results) == [False, True, True, True, True]
+    assert all((flow.out / f"o{i}.mp4").read_bytes() == MP4 for i in range(5))
+    assert {c[2]["headers"]["Idempotency-Key"] for c in _creates(flow)} and len(list((flow.tmp / "state").glob("*.tmp"))) == 0
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_f3_processes_same_key_create_exactly_one_video(flow, monkeypatch):
+    import multiprocessing
+
+    counter = flow.tmp / "creates.log"
+    _slow_create(flow, monkeypatch, counter_file=counter)
+    ctx = multiprocessing.get_context("fork")
+    q = ctx.Queue()
+
+    def child(i):
+        out = _run(flow, output_path=str(flow.out / f"p{i}.mp4"))
+        q.put((out.success, out.data["execution_id"], out.data["resumed"]))
+
+    procs = [ctx.Process(target=child, args=(i,)) for i in range(3)]
+    [p.start() for p in procs]
+    got = [q.get(timeout=30) for _ in procs]
+    [p.join(timeout=30) for p in procs]
+    assert all(p.exitcode == 0 for p in procs)
+    assert len(counter.read_text().split()) == 1
+    assert {g[1] for g in got} == {"vid_1"} and all(g[0] for g in got)
+    assert sorted(g[2] for g in got) == [False, True, True]
+
+
+def test_f3_different_keys_do_not_block_each_other(flow, monkeypatch):
+    _slow_create(flow, monkeypatch, delay=0.3)
+    flow.create_id = "vid_x"
+    t0 = time.monotonic()
+    ts = [threading.Thread(target=_run, args=(flow,), kwargs={"prompt": f"p{i}", "output_path": str(flow.out / f"d{i}.mp4")})
+          for i in range(3)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(_creates(flow)) == 3 and time.monotonic() - t0 < 0.85
+
+
+def test_f3_job_saves_use_unique_temp_files_and_never_collide(flow):
+    key = "k" * 8
+    errors = []
+
+    def worker(i):
+        try:
+            for n in range(50):
+                _shared._save_heygen_job(key, {"idempotency_key": f"id{i}", "created_at": time.time(), "n": n})
+        except Exception as exc:
+            errors.append(repr(exc))
+
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert errors == []
+    assert _shared._load_heygen_job(key) is not None
+    assert sorted(p.name for p in (flow.tmp / "state").iterdir()) == [key + ".json"]
+
+
+def test_f3_concurrent_downloads_to_one_path_do_not_collide(monkeypatch, tmp_path):
+    _get_returning(monkeypatch, lambda url: Resp(chunks=[MP4[:12], MP4[12:]]))
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(30):
+                _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
+        except Exception as exc:
+            errors.append(repr(exc))
+
+    ts = [threading.Thread(target=worker) for _ in range(5)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert errors == []
+    assert [p.name for p in tmp_path.iterdir()] == ["o.mp4"] and (tmp_path / "o.mp4").read_bytes() == MP4
+
+
+def test_f3_lock_wait_times_out_instead_of_hanging(flow):
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with _shared._heygen_job_lock("kk"):
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    held.wait(5)
+    try:
+        with pytest.raises(TimeoutError):
+            with _shared._heygen_job_lock("kk", timeout=0.2):
+                pass
+    finally:
+        release.set()
+        t.join()
+    with _shared._heygen_job_lock("kk", timeout=1):   # free again
+        pass
+
+
+def test_f3_state_dir_is_0700_and_files_0600(flow):
+    old = os.umask(0o022)
+    try:
+        _shared._save_heygen_job("modekey", {"idempotency_key": "a", "created_at": time.time()})
+        with _shared._heygen_job_lock("modekey"):
+            pass
+    finally:
+        os.umask(old)
+    d = flow.tmp / "state"
+    assert stat.S_IMODE(d.stat().st_mode) == 0o700
+    for p in d.iterdir():
+        assert stat.S_IMODE(p.stat().st_mode) == 0o600, p.name
+
+
+@pytest.mark.parametrize("created", ["NaN", "Infinity", "-Infinity"])
+def test_f3_non_finite_created_at_is_ignored(flow, created):
+    p = _shared._heygen_job_path("nankey")
+    p.parent.mkdir(parents=True)
+    p.write_text('{"idempotency_key": "a", "video_id": "v1", "created_at": %s}' % created)
+    assert _shared._load_heygen_job("nankey") is None

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -396,7 +399,8 @@ def _load_heygen_job(key: str) -> dict[str, Any] | None:
     """Saved job for this key, or None if missing, expired or malformed."""
     try:
         job = json.loads(_heygen_job_path(key).read_text())
-        if time.time() - float(job["created_at"]) > HEYGEN_JOB_TTL_SECONDS:
+        created = float(job["created_at"])
+        if not math.isfinite(created) or time.time() - created > HEYGEN_JOB_TTL_SECONDS:
             return None
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job["idempotency_key"]):
             return None
@@ -408,11 +412,49 @@ def _load_heygen_job(key: str) -> dict[str, Any] | None:
 
 
 def _save_heygen_job(key: str, job: dict[str, Any]) -> None:
+    """Write the job file atomically: unique temp file (mode 0600) in the same
+    directory, then rename. The directory is created with mode 0700."""
     path = _heygen_job_path(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(job))
-    tmp.replace(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(job))
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+@contextlib.contextmanager
+def _heygen_job_lock(key: str, timeout: float = 180.0):
+    """Exclusive advisory lock for one request key (a <key>.lock file next to the job
+    file), so two runs with the same key cannot both create a video. Held from the
+    job load until the video_id is saved, not while polling. Released by the OS if the
+    process dies."""
+    path = _heygen_job_path(key).with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Timed out waiting for another HeyGen run with the same request") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock
 
 
 def _clear_heygen_job(key: str) -> None:
@@ -577,10 +619,13 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
             if declared.isdigit() and int(declared) > max_bytes:
                 raise ValueError(f"HeyGen video is larger than the {max_bytes} byte limit")
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = output_path.with_name(output_path.name + ".part")
+            # Unique temp file in the same directory (never a shared <name>.part), then an
+            # atomic rename, so concurrent downloads to one path cannot corrupt each other.
+            fd, tmp_name = tempfile.mkstemp(dir=output_path.parent, prefix=output_path.name + ".", suffix=".part")
+            tmp = Path(tmp_name)
             written = 0
             try:
-                with tmp.open("wb") as fh:
+                with os.fdopen(fd, "wb") as fh:
                     try:
                         for chunk in resp.iter_content(chunk_size=1024 * 1024):
                             written += len(chunk)
@@ -593,7 +638,8 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
                         raise RuntimeError(f"HeyGen video download failed: {failure}")
                 if written == 0:
                     raise RuntimeError("HeyGen video download was empty")
-                tmp.replace(output_path)
+                os.chmod(tmp, 0o644)  # mkstemp creates 0600; keep the usual mode for a media file
+                os.replace(tmp, output_path)
             except BaseException:
                 tmp.unlink(missing_ok=True)
                 raise
@@ -764,65 +810,66 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     # billing) a new video. The saved Idempotency-Key also makes a retry after a
     # timed-out create return the original response.
     job_key = heygen_idempotency_key(inputs)
-    job = _load_heygen_job(job_key)
-    if job is None:
-        job = {"idempotency_key": uuid.uuid4().hex, "created_at": time.time()}
-        _save_heygen_job(job_key, job)
-    resumed = "video_id" in job
+    with _heygen_job_lock(job_key):
+        job = _load_heygen_job(job_key)
+        if job is None:
+            job = {"idempotency_key": uuid.uuid4().hex, "created_at": time.time()}
+            _save_heygen_job(job_key, job)
+        resumed = "video_id" in job
 
-    if resumed:
-        video_id = job["video_id"]
-    else:
-        body: dict[str, Any] = {"model": HEYGEN_V3_MODEL, "mode": operation, "prompt": prompt}
-        if "duration" in inputs:
-            body["duration"] = int(inputs["duration"])
-        if "resolution" in inputs:
-            body["resolution"] = inputs["resolution"]
-        if operation == "image_to_video":
-            ref_url = inputs.get("reference_image_url")
-            ref_path = inputs.get("reference_image_path")
-            if ref_url:
-                image = {"type": "url", "url": ref_url}
-            elif ref_path:
-                image = upload_image_heygen(ref_path, api_key)
-            else:
-                return ToolResult(
-                    success=False,
-                    error="image_to_video requires reference_image_url or reference_image_path",
-                )
-            body["image"] = image  # image_to_video follows the first frame; no aspect_ratio
+        if resumed:
+            video_id = job["video_id"]
         else:
-            body["aspect_ratio"] = aspect_ratio
+            body: dict[str, Any] = {"model": HEYGEN_V3_MODEL, "mode": operation, "prompt": prompt}
+            if "duration" in inputs:
+                body["duration"] = int(inputs["duration"])
+            if "resolution" in inputs:
+                body["resolution"] = inputs["resolution"]
+            if operation == "image_to_video":
+                ref_url = inputs.get("reference_image_url")
+                ref_path = inputs.get("reference_image_path")
+                if ref_url:
+                    image = {"type": "url", "url": ref_url}
+                elif ref_path:
+                    image = upload_image_heygen(ref_path, api_key)
+                else:
+                    return ToolResult(
+                        success=False,
+                        error="image_to_video requires reference_image_url or reference_image_path",
+                    )
+                body["image"] = image  # image_to_video follows the first frame; no aspect_ratio
+            else:
+                body["aspect_ratio"] = aspect_ratio
 
-        try:
-            response = requests.post(
-                f"{HEYGEN_API_BASE}/v3/models/videos",
-                headers={
-                    "X-Api-Key": api_key,
-                    "Content-Type": "application/json",
-                    "Idempotency-Key": job["idempotency_key"],
-                },
-                json=body,
-                timeout=30,
-            )
-            response.raise_for_status()
-        except requests.HTTPError as exc:
-            # A 4xx (not 409) means HeyGen rejected the request, so nothing was billed:
-            # drop the saved key. A timeout or 5xx may have been accepted: keep it.
-            code = getattr(exc.response, "status_code", 0) or 0
-            if 400 <= code < 500 and code != 409:
-                _clear_heygen_job(job_key)
-            raise
-        payload = response.json()
-        video_id = payload.get("data", {}).get("video_id")
-        if not video_id:
-            return ToolResult(success=False, error="No video_id in HeyGen v3 response")
-        try:
-            validate_heygen_video_id(video_id)  # before the poll URL and the file name
-        except ValueError as exc:
-            return ToolResult(success=False, error=str(exc))
-        job["video_id"] = video_id
-        _save_heygen_job(job_key, job)  # before polling, so a re-run resumes this id
+            try:
+                response = requests.post(
+                    f"{HEYGEN_API_BASE}/v3/models/videos",
+                    headers={
+                        "X-Api-Key": api_key,
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": job["idempotency_key"],
+                    },
+                    json=body,
+                    timeout=30,
+                )
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                # A 4xx (not 409) means HeyGen rejected the request, so nothing was billed:
+                # drop the saved key. A timeout or 5xx may have been accepted: keep it.
+                code = getattr(exc.response, "status_code", 0) or 0
+                if 400 <= code < 500 and code != 409:
+                    _clear_heygen_job(job_key)
+                raise
+            payload = response.json()
+            video_id = payload.get("data", {}).get("video_id")
+            if not video_id:
+                return ToolResult(success=False, error="No video_id in HeyGen v3 response")
+            try:
+                validate_heygen_video_id(video_id)  # before the poll URL and the file name
+            except ValueError as exc:
+                return ToolResult(success=False, error=str(exc))
+            job["video_id"] = video_id
+            _save_heygen_job(job_key, job)  # before polling, so a re-run resumes this id
     execution_id = video_id  # kept as a result field name for callers
 
     try:
