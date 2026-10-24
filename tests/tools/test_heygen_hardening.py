@@ -951,3 +951,94 @@ def test_f4_asset_dir_env_accepts_several_entries(flow, monkeypatch, tmp_path):
 def test_f4_missing_upload_file_outside_roots_does_not_reveal_existence(flow):
     with pytest.raises(ValueError, match="outside"):          # not FileNotFoundError
         _shared.validate_heygen_upload_path(str(flow.tmp / "does-not-exist.png"))
+
+
+# ------------------------------------------------ Low F5: upload_image_fal (used by video_selector) is validated
+
+@pytest.fixture
+def fal(flow, assets, monkeypatch):
+    monkeypatch.setenv("FAL_KEY", "test-not-a-fal-key")
+    calls = []
+
+    def post(url, **kw):
+        calls.append(("POST", url, kw))
+        return Resp({"upload_url": "https://fal.example/put", "file_url": "https://fal.example/f.png"})
+
+    def put(url, **kw):
+        calls.append(("PUT", url, kw))
+        return Resp()
+
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("requests.put", put)
+    return calls
+
+
+def test_f5_fal_upload_refuses_paths_outside_roots_without_any_request(fal, flow, monkeypatch):
+    monkeypatch.delenv("FAL_KEY")                      # validation comes before the key check
+    secret = flow.tmp / "id_rsa.png"
+    secret.write_bytes(PNG)
+    with pytest.raises(ValueError, match="outside"):
+        _shared.upload_image_fal(str(secret))
+    with pytest.raises(ValueError, match="outside"):
+        _shared.upload_image_fal("/etc/passwd")
+    assert fal == []
+
+
+@pytest.mark.parametrize("name,data,match", [
+    ("id_rsa", PNG, "only png"),
+    ("notes.txt", PNG, "only png"),
+    ("fake.png", b"-----BEGIN OPENSSH PRIVATE KEY-----", "does not match"),
+    ("big.png", PNG, "size"),
+])
+def test_f5_fal_upload_checks_type_and_size(fal, assets, monkeypatch, name, data, match):
+    p = assets / name
+    p.write_bytes(data)
+    if name == "big.png":
+        monkeypatch.setattr(_shared, "HEYGEN_MAX_UPLOAD_BYTES", 10)
+    with pytest.raises(ValueError, match=match):
+        _shared.upload_image_fal(str(p))
+    assert fal == []
+
+
+def test_f5_fal_upload_uses_sniffed_type_and_sends_the_validated_bytes(fal, assets):
+    p = assets / "pic.JPG"
+    p.write_bytes(JPEG)
+    assert _shared.upload_image_fal(str(p)) == "https://fal.example/f.png"
+    (_, _, init), (_, _, put) = fal
+    assert init["json"] == {"content_type": "image/jpeg", "file_name": "pic.JPG"}
+    assert put["data"] == JPEG and put["headers"]["Content-Type"] == "image/jpeg"
+
+
+def test_f5_file_swapped_after_validation_is_not_sent(fal, assets, monkeypatch):
+    p = assets / "a.png"
+    p.write_bytes(PNG)
+    real = _shared.validate_upload_path
+
+    def validate_then_swap(path):
+        out = real(path)
+        p.write_bytes(b"secret text that is not an image")
+        return out
+
+    monkeypatch.setattr(_shared, "validate_upload_path", validate_then_swap)
+    with pytest.raises(ValueError, match="changed"):
+        _shared.upload_image_fal(str(p))
+    assert fal == []
+
+
+def test_f5_heygen_fallback_path_still_works_with_validated_fal(flow, assets, monkeypatch):
+    p = assets / "a.png"
+    p.write_bytes(PNG)
+    real_post = requests.post
+
+    def post(url, **kw):
+        if url.endswith("/v3/assets"):
+            return Resp({}, status=500)
+        if "fal.ai" in url:
+            return Resp({"upload_url": "https://fal.example/put", "file_url": "https://fal.example/f.png"})
+        return real_post(url, **kw)
+
+    monkeypatch.setattr("requests.post", post)
+    monkeypatch.setattr("requests.put", lambda *a, **k: Resp())
+    monkeypatch.setenv("FAL_KEY", "test-not-a-fal-key")
+    monkeypatch.setenv("HEYGEN_ALLOW_FAL_FALLBACK", "1")
+    assert _shared.upload_image_heygen(str(p), "k") == {"type": "url", "url": "https://fal.example/f.png"}

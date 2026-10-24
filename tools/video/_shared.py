@@ -650,21 +650,20 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
 
 
 def upload_image_fal(image_path: str) -> str:
-    """Upload a local image to fal.ai storage and return a public URL."""
+    """Upload a local image to fal.ai storage and return a public URL.
+
+    The path goes through the same checks as HeyGen uploads (validate_upload_path:
+    inside the allowed asset roots, png/jpeg/webp, at most 32 MB, magic bytes match
+    the extension), so an agent-supplied path cannot publish an arbitrary local file.
+    """
     import requests
+
+    path, content_type = validate_upload_path(image_path)
+    data_bytes = _read_validated_image(path, content_type)
 
     api_key = os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")
     if not api_key:
         raise RuntimeError("FAL_KEY or FAL_AI_API_KEY required for image upload")
-
-    path = Path(image_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    suffix = path.suffix.lower()
-    content_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(
-        suffix.lstrip("."), "image/png"
-    )
 
     # Initiate upload
     init_resp = requests.post(
@@ -680,7 +679,7 @@ def upload_image_fal(image_path: str) -> str:
     put_resp = requests.put(
         data["upload_url"],
         headers={"Content-Type": content_type},
-        data=path.read_bytes(),
+        data=data_bytes,
         timeout=60,
     )
     put_resp.raise_for_status()
@@ -759,6 +758,18 @@ def validate_heygen_upload_path(image_path: str) -> tuple[Path, str]:
     return resolved, content_type
 
 
+validate_upload_path = validate_heygen_upload_path  # generic name for non-HeyGen callers
+
+
+def _read_validated_image(path: Path, content_type: str) -> bytes:
+    """Read the file once and re-check size and magic bytes on the bytes that are sent,
+    so a file swapped or grown after validate_upload_path is not uploaded."""
+    data = path.read_bytes()
+    if not data or len(data) > HEYGEN_MAX_UPLOAD_BYTES or _sniff_image_type(data[:16]) != content_type:
+        raise ValueError(f"Refusing to upload {path.name}: file changed during validation")
+    return data
+
+
 def upload_image_heygen(image_path: str, api_key: str) -> dict[str, str]:
     """Upload a local image with POST /v3/assets (multipart) and return a v3
     asset input ({"type": "asset_id", "asset_id": ...}).
@@ -772,14 +783,14 @@ def upload_image_heygen(image_path: str, api_key: str) -> dict[str, str]:
 
     path, content_type = validate_heygen_upload_path(image_path)
 
+    data = _read_validated_image(path, content_type)
     try:
-        with path.open("rb") as fh:
-            resp = requests.post(
-                f"{HEYGEN_API_BASE}/v3/assets",
-                headers={"X-Api-Key": api_key},
-                files={"file": (path.name, fh, content_type)},
-                timeout=60,
-            )
+        resp = requests.post(
+            f"{HEYGEN_API_BASE}/v3/assets",
+            headers={"X-Api-Key": api_key},
+            files={"file": (path.name, data, content_type)},
+            timeout=60,
+        )
         asset_id = resp.json().get("data", {}).get("asset_id") if resp.status_code in (200, 201) else None
         failure = "no asset_id in response" if resp.status_code in (200, 201) else f"HTTP {resp.status_code}"
     except Exception as exc:
