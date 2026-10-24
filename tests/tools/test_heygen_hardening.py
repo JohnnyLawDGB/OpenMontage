@@ -111,9 +111,9 @@ def test_h1_download_refuses_bad_scheme_or_host(monkeypatch, tmp_path, url):
 
 
 def test_h1_download_streams_without_key_and_no_redirect_follow(monkeypatch, tmp_path):
-    seen = _get_returning(monkeypatch, Resp(chunks=[b"ab", b"cd"], headers={"Content-Type": "video/mp4"}))
+    seen = _get_returning(monkeypatch, Resp(chunks=[MP4[:7], MP4[7:]], headers={"Content-Type": "video/mp4"}))
     n = _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
-    assert n == 4 and (tmp_path / "o.mp4").read_bytes() == b"abcd"
+    assert n == len(MP4) and (tmp_path / "o.mp4").read_bytes() == MP4
     kw = seen[0][1]
     assert kw["stream"] is True and kw["allow_redirects"] is False
     assert "headers" not in kw or not kw["headers"]
@@ -148,7 +148,7 @@ def test_h1_redirect_within_allowlist_is_followed(monkeypatch, tmp_path):
     def resp(url):
         if url == GOOD_URL:
             return Resp(status=302, headers={"Location": "https://files.heygen.com/real.mp4"})
-        return Resp(chunks=[b"ok"])
+        return Resp(chunks=[MP4])
 
     seen = _get_returning(monkeypatch, resp)
     _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
@@ -1105,3 +1105,53 @@ def test_f7_with_broad_dir_outputs_and_uploads_outside_the_repo_are_still_refuse
     assert not out.success and flow.log == []
     with pytest.raises(ValueError):
         _shared.validate_heygen_upload_path("/etc/passwd")
+
+
+# ------------------------------------------------ Low F8: content type, magic bytes, length, deadline
+
+@pytest.mark.parametrize("ctype", ["video/mp4", "video/quicktime", "application/octet-stream",
+                                   "VIDEO/MP4; codecs=avc1", " application/octet-stream ", ""])
+def test_f8_accepted_content_types(monkeypatch, tmp_path, ctype):
+    _get_returning(monkeypatch, Resp(headers={"Content-Type": ctype}))
+    assert _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4") == len(MP4)
+
+
+@pytest.mark.parametrize("ctype", ["text/html", "text/plain", "application/json", "image/png",
+                                   "application/x-msdownload", "video", "application/octet-stream-x", "multipart/form-data"])
+def test_f8_refused_content_types(monkeypatch, tmp_path, ctype):
+    _get_returning(monkeypatch, Resp(headers={"Content-Type": ctype}))
+    with pytest.raises(ValueError, match="content type"):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("body", [
+    b"<html>signed url expired</html>",
+    b"MZ" + b"\x90" * 30,
+    b"\x89PNG\r\n\x1a\n" + b"0" * 20,
+    b"short",
+    b"\x00\x00\x00\x18ftyx" + b"0" * 20,
+])
+@pytest.mark.parametrize("ctype", ["video/mp4", "application/octet-stream", ""])
+def test_f8_body_must_start_like_an_mp4(monkeypatch, tmp_path, body, ctype):
+    _get_returning(monkeypatch, Resp(chunks=[body], headers={"Content-Type": ctype}))
+    with pytest.raises(ValueError, match="not an mp4"):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_f8_non_ascii_digit_content_length_does_not_crash(monkeypatch, tmp_path):
+    _get_returning(monkeypatch, Resp(headers={"Content-Length": "\u00b2\u0663"}))
+    assert _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4") == len(MP4)
+
+
+def test_f8_overall_deadline_stops_a_slow_download(monkeypatch, tmp_path):
+    monkeypatch.setattr(_shared, "HEYGEN_DOWNLOAD_DEADLINE_SECONDS", -1)
+    _get_returning(monkeypatch, Resp())
+    with pytest.raises(RuntimeError, match="too long"):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_f8_deadline_default_is_fifteen_minutes():
+    assert _shared.HEYGEN_DOWNLOAD_DEADLINE_SECONDS == 15 * 60

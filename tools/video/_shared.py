@@ -513,6 +513,7 @@ def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
 HEYGEN_DOWNLOAD_HOST_SUFFIXES = ("heygen.ai", "heygen.com")
 HEYGEN_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
 HEYGEN_MAX_REDIRECTS = 3
+HEYGEN_DOWNLOAD_DEADLINE_SECONDS = 15 * 60  # whole body, so a slow-drip server cannot hold the job open
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
@@ -616,7 +617,7 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
             if ctype and not (ctype.startswith("video/") or ctype == "application/octet-stream"):
                 raise ValueError(f"Unexpected content type for HeyGen video download: {ctype}")
             declared = resp.headers.get("Content-Length", "")
-            if declared.isdigit() and int(declared) > max_bytes:
+            if declared.isascii() and declared.isdigit() and int(declared) > max_bytes:
                 raise ValueError(f"HeyGen video is larger than the {max_bytes} byte limit")
             output_path.parent.mkdir(parents=True, exist_ok=True)
             # Unique temp file in the same directory (never a shared <name>.part), then an
@@ -624,6 +625,8 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
             fd, tmp_name = tempfile.mkstemp(dir=output_path.parent, prefix=output_path.name + ".", suffix=".part")
             tmp = Path(tmp_name)
             written = 0
+            head = b""
+            deadline = time.monotonic() + HEYGEN_DOWNLOAD_DEADLINE_SECONDS
             try:
                 with os.fdopen(fd, "wb") as fh:
                     try:
@@ -631,6 +634,10 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
                             written += len(chunk)
                             if written > max_bytes:
                                 raise ValueError(f"HeyGen video exceeded the {max_bytes} byte limit")
+                            if time.monotonic() > deadline:
+                                raise RuntimeError("HeyGen video download took too long")
+                            if len(head) < 12:
+                                head = (head + chunk)[:12]
                             fh.write(chunk)
                     except requests.RequestException as exc:
                         failure = type(exc).__name__
@@ -638,6 +645,8 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
                         raise RuntimeError(f"HeyGen video download failed: {failure}")
                 if written == 0:
                     raise RuntimeError("HeyGen video download was empty")
+                if head[4:8] != b"ftyp":  # every mp4 starts with a size field then 'ftyp'
+                    raise ValueError("HeyGen video download is not an mp4 file")
                 os.chmod(tmp, 0o644)  # mkstemp creates 0600; keep the usual mode for a media file
                 os.replace(tmp, output_path)
             except BaseException:

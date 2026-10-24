@@ -18,8 +18,11 @@ LEGACY = re.compile(r"heygen\.com/v[12]/")
 REPO = Path(__file__).resolve().parents[2]
 
 
+MP4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 20
+
+
 class Resp:
-    def __init__(self, payload=None, status=200, content=b"MP4"):
+    def __init__(self, payload=None, status=200, content=MP4):
         self._p, self.status_code, self.content = payload or {}, status, content
         self.headers = {}
 
@@ -56,7 +59,7 @@ def calls(monkeypatch, tmp_path):
     def get(url, **kw):
         log.append(("GET", url, kw))
         if "resource2.heygen.ai" in url:
-            return Resp(content=b"MP4")
+            return Resp(content=MP4)
         return Resp(next(polls))
 
     monkeypatch.setattr("requests.post", post)
@@ -74,7 +77,7 @@ def test_text_to_video_uses_v3_models_videos(calls, tmp_path):
     assert post[2]["json"] == {"model": "heygen-video-1", "mode": "text_to_video",
                                "prompt": "a coin", "aspect_ratio": "16:9"}
     assert [c[1] for c in calls if c[0] == "GET"][:2] == ["https://api.heygen.com/v3/models/videos/vid_1"] * 2
-    assert out.read_bytes() == b"MP4"
+    assert out.read_bytes() == MP4
     assert not any(LEGACY.search(c[1]) for c in calls)
 
 
