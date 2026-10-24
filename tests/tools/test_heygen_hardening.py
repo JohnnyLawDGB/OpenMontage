@@ -497,3 +497,106 @@ def test_h4_square_text_to_video_at_1080p_or_2k_is_rejected_before_any_call(flow
     assert not out.success and "16:9 or 9:16" in out.error and flow.log == []
     assert _run(flow, aspect_ratio="9:16", resolution=res).success
     assert _run(flow, aspect_ratio="1:1", resolution="768p").success
+
+
+# ------------------------------------------------ Security flag F1: host parser differential
+
+F1_BAD = [
+    "https://evil.tld\\@heygen.ai/v.mp4",
+    "https://127.0.0.1:1\\@heygen.ai/v.mp4?X-Amz-Signature=a",
+    "https://evil.tld@heygen.ai/v.mp4",
+    "https://heygen.ai:evil@evil.tld/v.mp4",
+    "https://user:pw@resource2.heygen.ai/v.mp4",
+    "https://heygen.ai:8443/v.mp4",
+    "https://resource2.heygen.ai:80/v.mp4",
+    "https://heygen.ai./v.mp4",             # trailing dot
+    "https://a..heygen.ai/v.mp4",           # empty label
+    "https://.heygen.ai/v.mp4",
+    "https://evil.tld\t.heygen.ai/v.mp4",
+    "https://evil.tld\x00.heygen.ai/v.mp4",
+    "https://evil.tld\n.heygen.ai/v.mp4",
+    "https:// heygen.ai/v.mp4",
+    "https://resource2.heygen.ai/v mp4",
+    "https://resource2.heygen.ai/v\\x.mp4",
+    "https://heygen。ai/v.mp4",
+    "https://hеygen.ai/v.mp4",              # cyrillic e
+    "https://ｈｅｙｇｅｎ.ai/v.mp4",
+    "https://heygen.ai%40evil.tld/v.mp4",
+    "https://heygen.ai%2eevil.tld/v.mp4",
+    "https://evil.tld#@heygen.ai/v.mp4",
+    "https://evil.tld?@heygen.ai/v.mp4",
+    "https://heygen.com.evil.tld/v.mp4",
+    "https://evilheygen.com/v.mp4",
+    "https://127.0.0.1/v.mp4",
+    "https://[::1]/v.mp4",
+    "https://2130706433/v.mp4",
+    "https://169.254.169.254/latest/meta-data/",
+    "//resource2.heygen.ai/v.mp4",
+    "resource2.heygen.ai/v.mp4",
+    "HTTP://resource2.heygen.ai/v.mp4",
+]
+F1_GOOD = [
+    "https://resource2.heygen.ai/v.mp4?X-Amz-Signature=a%40b&Expires=1",
+    "https://RESOURCE2.HeyGen.AI/v.mp4",
+    "https://files.heygen.ai:443/video/abc123.mp4",
+    "https://x.heygen.com/ok",
+    "https://heygen.ai/v.mp4",
+]
+
+
+@pytest.mark.parametrize("url", F1_BAD)
+def test_f1_initial_url_is_refused_without_a_request(monkeypatch, tmp_path, url):
+    seen = _get_returning(monkeypatch, Resp())
+    with pytest.raises(ValueError, match="Refusing"):
+        _shared.download_heygen_video(url, tmp_path / "o.mp4")
+    assert seen == [] and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("url", [u for u in F1_BAD if "://" in u and not u.startswith("//")])
+def test_f1_same_strings_as_redirect_location_are_refused(monkeypatch, tmp_path, url):
+    seen = _get_returning(monkeypatch, Resp(status=302, headers={"Location": url}))
+    with pytest.raises(ValueError, match="Refusing"):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4")
+    assert [u for u, _ in seen] == [GOOD_URL]
+
+
+@pytest.mark.parametrize("url", F1_GOOD)
+def test_f1_normal_signed_urls_still_pass(monkeypatch, tmp_path, url):
+    seen = _get_returning(monkeypatch, Resp())
+    _shared.download_heygen_video(url, tmp_path / "o.mp4")
+    assert [u for u, _ in seen] == [url]
+
+
+@pytest.mark.parametrize("url", F1_BAD + F1_GOOD)
+def test_f1_accepted_urls_have_one_host_for_both_parsers(url):
+    from urllib.parse import urlsplit
+    from urllib3.util import parse_url
+
+    if _shared._heygen_download_url_ok(url):
+        assert (parse_url(url).host or "").lower() == urlsplit(url).hostname.lower()
+
+
+def test_f1_the_known_differential_is_real_and_is_caught():
+    from urllib.parse import urlsplit
+    from urllib3.util import parse_url
+
+    url = "https://evil.tld\\@heygen.ai/v.mp4"
+    assert urlsplit(url).hostname == "heygen.ai" and parse_url(url).host != "heygen.ai"
+    assert _shared._heygen_download_host_allowed(urlsplit(url).hostname)   # host check alone is fooled
+    assert not _shared._heygen_download_url_ok(url)                        # the full check is not
+
+
+def test_f1_refusal_names_host_only_for_well_formed_urls(monkeypatch, tmp_path):
+    with pytest.raises(ValueError) as e:
+        _shared.download_heygen_video("https://cdn.other.example/v.mp4?Signature=SECRETSIG", tmp_path / "o.mp4")
+    assert "cdn.other.example" in str(e.value) and "SECRETSIG" not in str(e.value)
+    with pytest.raises(ValueError) as e:
+        _shared.download_heygen_video("https://evil.tld\\@heygen.ai/v.mp4?Signature=SECRETSIG", tmp_path / "o.mp4")
+    assert "evil" not in str(e.value) and "SECRETSIG" not in str(e.value)
+
+
+@pytest.mark.parametrize("extra", ["127.0.0.1", "localhost", "a b", "..x", "evil.tld\\@x"])
+def test_f1_extra_hosts_env_ignores_nonsense_entries_but_never_ips_via_syntax(monkeypatch, extra):
+    monkeypatch.setenv("HEYGEN_EXTRA_DOWNLOAD_HOSTS", extra)
+    assert not _shared._heygen_download_url_ok("https://evil.tld\\@heygen.ai/v.mp4")
+    assert not _shared._heygen_download_url_ok("https://evil.tld/v.mp4")

@@ -474,18 +474,60 @@ HEYGEN_MAX_REDIRECTS = 3
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
+_HOSTNAME_RE = re.compile(r"[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})*")
+
+
 def _heygen_download_host_allowed(host: str | None) -> bool:
-    host = (host or "").lower().rstrip(".")
-    if not host:
+    host = (host or "").lower()
+    if not _HOSTNAME_RE.fullmatch(host):  # no empty labels, no trailing dot, no odd characters
         return False
     extra = {h.strip().lower() for h in os.environ.get("HEYGEN_EXTRA_DOWNLOAD_HOSTS", "").split(",") if h.strip()}
     return host in extra or any(host == s or host.endswith("." + s) for s in HEYGEN_DOWNLOAD_HOST_SUFFIXES)
 
 
+def _https_url_syntax_ok(url: str) -> bool:
+    """True if url is a plain https URL that urllib.parse and urllib3 (what requests
+    connects with) read the same way.
+
+    Rejects non-ASCII, whitespace, control characters and backslashes anywhere in the
+    string, userinfo, ports other than 443, and any difference between the two parsers
+    about the host (for example https://evil.tld\\@heygen.ai/).
+    """
+    from urllib3.util import parse_url
+
+    if not isinstance(url, str) or not url.isascii():
+        return False
+    if any(ord(c) <= 0x20 or ord(c) == 0x7F or c == "\\" for c in url):
+        return False
+    try:
+        p = urlsplit(url)
+        if p.scheme != "https" or p.username is not None or p.password is not None:
+            return False
+        if p.port not in (None, 443):
+            return False
+        q = parse_url(url)
+    except ValueError:
+        return False
+    host = (p.hostname or "").lower()
+    return bool(host) and (q.host or "").lower() == host and q.scheme == "https" and q.auth is None
+
+
+def _heygen_download_url_ok(url: str) -> bool:
+    return _https_url_syntax_ok(url) and _heygen_download_host_allowed(urlsplit(url).hostname)
+
+
+def _refusal(url: str) -> ValueError:
+    # Name the host only when the URL is well formed and just not allowlisted, so an
+    # operator can add it to HEYGEN_EXTRA_DOWNLOAD_HOSTS. Never the path or query (signed).
+    if _https_url_syntax_ok(url):
+        return ValueError(f"Refusing HeyGen video download from host {urlsplit(url).hostname}")
+    return ValueError("Refusing HeyGen video download (url not allowed)")
+
+
 def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HEYGEN_MAX_DOWNLOAD_BYTES) -> int:
     """Download a completed HeyGen video to output_path and return its size.
 
-    https only, host allowlist (re-checked on every redirect), streamed to a
+    https only, host allowlist and parser agreement (re-checked on every redirect), streamed to a
     .part file with a size cap. No API key is sent. The URL is never put in an
     error message because it is a signed URL.
     """
@@ -493,15 +535,16 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
 
     url = video_url
     for _ in range(HEYGEN_MAX_REDIRECTS + 1):
-        parts = urlsplit(url)
-        if parts.scheme != "https" or not _heygen_download_host_allowed(parts.hostname):
-            raise ValueError(f"Refusing HeyGen video download from {parts.scheme}://{parts.hostname}")
+        if not _heygen_download_url_ok(url):  # initial URL and every redirect hop
+            raise _refusal(url)
         resp = requests.get(url, stream=True, timeout=120, allow_redirects=False)
         try:
             if resp.status_code in _REDIRECT_CODES:
                 location = resp.headers.get("Location")
                 if not location:
                     raise RuntimeError("HeyGen video download redirect without Location")
+                if any(ord(c) <= 0x20 or ord(c) == 0x7F or c == "\\" for c in location):
+                    raise _refusal("")  # urljoin would silently drop tabs and newlines
                 url = urljoin(url, location)
                 continue
             resp.raise_for_status()
