@@ -1078,3 +1078,30 @@ def test_f6_plain_https_reference_url_is_sent_as_is(flow, url):
 
 def test_f6_text_to_video_ignores_the_field(flow):
     assert _run(flow, reference_image_url="http://bad.example/").success
+
+
+# ------------------------------------------------ Low F7: broad OPENMONTAGE_ASSET_DIR values are ignored
+
+@pytest.mark.parametrize("bad", ["/", "/tmp", "/home", "/etc", "~", "~/..", "//", "/usr/"])
+def test_f7_broad_asset_dir_is_ignored_with_a_warning(monkeypatch, caplog, bad):
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", bad)
+    with caplog.at_level("WARNING"):
+        roots = _shared._allowed_asset_roots()
+    assert [r.name for r in roots] == ["projects", "assets"]
+    assert "too broad" in caplog.text
+
+
+def test_f7_home_directory_itself_is_ignored_but_a_subfolder_is_fine(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "me"))
+    (tmp_path / "me" / "media").mkdir(parents=True)
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", os.pathsep.join([str(tmp_path / "me"), str(tmp_path / "me" / "media")]))
+    roots = _shared._allowed_asset_roots()
+    assert (tmp_path / "me" / "media").resolve() in roots and (tmp_path / "me").resolve() not in roots
+
+
+def test_f7_with_broad_dir_outputs_and_uploads_outside_the_repo_are_still_refused(flow, monkeypatch):
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", "/")
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.tmp / "x.mp4")})
+    assert not out.success and flow.log == []
+    with pytest.raises(ValueError):
+        _shared.validate_heygen_upload_path("/etc/passwd")

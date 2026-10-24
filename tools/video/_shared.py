@@ -701,16 +701,28 @@ def _sniff_image_type(head: bytes) -> str | None:
     return None
 
 
+def _root_too_broad(root: Path) -> bool:
+    """A root that is the filesystem root, the home directory, a parent of it, or has
+    fewer than three path components (for example / or /tmp) would allow almost any file."""
+    home = Path.home().resolve()
+    return len(root.parts) < 3 or root == home or home.is_relative_to(root)
+
+
 def _allowed_asset_roots() -> list[Path]:
     """Directories that reference images may be read from and videos written to:
     <repo>/projects, <repo>/assets and each OPENMONTAGE_ASSET_DIR entry (os.pathsep
     separated). Resolved, so symlinks in the roots themselves are followed."""
     repo_root = Path(__file__).resolve().parents[2]
-    roots = [repo_root / "projects", repo_root / "assets"]
+    roots = [(repo_root / "projects").resolve(), (repo_root / "assets").resolve()]
     for part in os.environ.get("OPENMONTAGE_ASSET_DIR", "").split(os.pathsep):
-        if part.strip():
-            roots.append(Path(part).expanduser())
-    return [r.resolve() for r in roots]
+        if not part.strip():
+            continue
+        root = Path(part).expanduser().resolve()
+        if _root_too_broad(root):
+            logger.warning("Ignoring OPENMONTAGE_ASSET_DIR entry %s: too broad (filesystem root, home directory or a parent of it)", root)
+            continue
+        roots.append(root)
+    return roots
 
 
 def _heygen_default_output_dir() -> Path:
