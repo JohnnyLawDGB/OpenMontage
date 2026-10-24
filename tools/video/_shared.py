@@ -702,6 +702,38 @@ def _sniff_image_type(head: bytes) -> str | None:
     return None
 
 
+def _allowed_asset_roots() -> list[Path]:
+    """Directories that reference images may be read from and videos written to:
+    <repo>/projects, <repo>/assets and each OPENMONTAGE_ASSET_DIR entry (os.pathsep
+    separated). Resolved, so symlinks in the roots themselves are followed."""
+    repo_root = Path(__file__).resolve().parents[2]
+    roots = [repo_root / "projects", repo_root / "assets"]
+    for part in os.environ.get("OPENMONTAGE_ASSET_DIR", "").split(os.pathsep):
+        if part.strip():
+            roots.append(Path(part).expanduser())
+    return [r.resolve() for r in roots]
+
+
+def _heygen_default_output_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "projects" / "_heygen"
+
+
+def validate_heygen_output_path(output_path: str | Path) -> Path:
+    """Return the resolved path a HeyGen video may be written to, or raise ValueError.
+
+    The path must resolve (symlinks followed, so a link pointing out of the roots is
+    refused) inside the allowed asset roots, end in .mp4 and not be a directory.
+    """
+    resolved = Path(output_path).resolve()
+    if not any(resolved.is_relative_to(root) for root in _allowed_asset_roots()):
+        raise ValueError(f"Refusing to write {resolved.name}: output_path is outside the project asset directory")
+    if resolved.suffix.lower() != ".mp4":
+        raise ValueError(f"Refusing to write {resolved.name}: output_path must end in .mp4")
+    if resolved.is_dir():
+        raise ValueError(f"Refusing to write {resolved.name}: output_path is a directory")
+    return resolved
+
+
 def validate_heygen_upload_path(image_path: str) -> tuple[Path, str]:
     """Return (resolved path, content type) for an image that may be uploaded.
 
@@ -710,14 +742,10 @@ def validate_heygen_upload_path(image_path: str) -> tuple[Path, str]:
     magic bytes match its extension; the content type comes from the magic bytes.
     """
     resolved = Path(image_path).resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-    repo_root = Path(__file__).resolve().parents[2]
-    roots = [repo_root / "projects", repo_root / "assets"]
-    if os.environ.get("OPENMONTAGE_ASSET_DIR"):
-        roots.append(Path(os.environ["OPENMONTAGE_ASSET_DIR"]).expanduser())
-    if not any(resolved.is_relative_to(root.resolve()) for root in roots):
+    if not any(resolved.is_relative_to(root) for root in _allowed_asset_roots()):
         raise ValueError(f"Refusing to upload {resolved.name}: outside the project asset directory")
+    if not resolved.is_file():  # after the roots check, so this is not a file-exists oracle
+        raise FileNotFoundError(f"Image not found: {image_path}")
     expected = _UPLOAD_IMAGE_TYPES.get(resolved.suffix.lower())
     if not expected:
         raise ValueError(f"Refusing to upload {resolved.name}: only png, jpg, jpeg and webp images are allowed")
@@ -806,6 +834,13 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
             error=f"HeyGen renders {inputs['resolution']} only in 16:9 or 9:16 for text_to_video, not {aspect_ratio}",
         )
 
+    # Confine the output file before anything is created or billed.
+    custom_output = inputs.get("output_path")
+    try:
+        output_path = validate_heygen_output_path(custom_output) if custom_output else None
+    except ValueError as exc:
+        return ToolResult(success=False, error=str(exc))
+
     # Resume: a job saved for the same request is polled instead of creating (and
     # billing) a new video. The saved Idempotency-Key also makes a retry after a
     # timed-out create return the original response.
@@ -884,7 +919,8 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
                 f"Saved HeyGen job {execution_id} no longer exists; cleared it, run again to start a new generation"
             ) from exc
         raise
-    output_path = Path(inputs.get("output_path", f"heygen_video_{execution_id}.mp4"))
+    if output_path is None:
+        output_path = validate_heygen_output_path(_heygen_default_output_dir() / f"heygen_video_{execution_id}.mp4")
     download_heygen_video(video_url, output_path)
 
     meta = HEYGEN_PROVIDERS[provider]

@@ -6,6 +6,7 @@ type checks, H4 idempotency and resume. requests.get / post / put are patched.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 
@@ -165,8 +166,8 @@ def test_h1_extra_host_env_is_exact_match(monkeypatch, tmp_path):
 def test_h1_flow_refuses_internal_video_url(flow):
     flow.video_url = "http://169.254.169.254/latest/meta-data"
     with pytest.raises(ValueError, match="Refusing"):
-        _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.tmp / "o.mp4")})
-    assert not (flow.tmp / "o.mp4").exists()
+        _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "o.mp4")})
+    assert not (flow.out / "o.mp4").exists()
     assert not any(c[1].startswith("http://169") for c in flow.log)
 
 
@@ -190,7 +191,7 @@ def test_h2_invalid_ids_rejected(vid):
 def test_h2_extra_b_create_response_id_checked_before_poll_and_filename(flow, vid):
     """Extra (b): rejected right after create; no GET poll URL, no file written."""
     flow.create_id = vid
-    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.tmp / "o.mp4")})
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "o.mp4")})
     assert not out.success and "video_id" in out.error
     assert [c for c in flow.log if c[0] == "GET"] == []
     assert [c for c in flow.log if c[0] == "POST"][0][1].endswith("/v3/models/videos")
@@ -204,11 +205,11 @@ def test_h2_poll_heygen_refuses_bad_id_without_request(flow):
 
 
 def test_h2_default_filename_uses_validated_id(flow, monkeypatch):
-    monkeypatch.chdir(flow.tmp)
+    monkeypatch.setattr(_shared, "_heygen_default_output_dir", lambda: flow.out)
     out = _shared.generate_heygen_video({"prompt": "p"})
     assert out.success, out.error
-    assert out.artifacts == ["heygen_video_vid_1.mp4"]
-    assert (flow.tmp / "heygen_video_vid_1.mp4").read_bytes() == MP4
+    assert out.artifacts == [str((flow.out / "heygen_video_vid_1.mp4").resolve())]
+    assert (flow.out / "heygen_video_vid_1.mp4").read_bytes() == MP4
 
 
 # ---------------------------------------------------------------- H3
@@ -222,7 +223,7 @@ WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"0" * 4
 def assets(monkeypatch, tmp_path):
     d = tmp_path / "assets_dir"
     d.mkdir()
-    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", str(d))
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", os.pathsep.join(filter(None, [os.environ.get("OPENMONTAGE_ASSET_DIR"), str(d)])))
     return d
 
 
@@ -335,7 +336,7 @@ def _creates(flow):
 
 
 def _run(flow, **inputs):
-    return _shared.generate_heygen_video({"prompt": "same prompt", "output_path": str(flow.tmp / "o.mp4"), **inputs})
+    return _shared.generate_heygen_video({"prompt": "same prompt", "output_path": str(flow.out / "o.mp4"), **inputs})
 
 
 def test_h4_key_fields_cover_the_create_request():
@@ -409,11 +410,11 @@ def test_h4_rerun_after_timeout_resumes_and_does_not_create_again(flow, monkeypa
 
 def test_h4_rerun_after_success_does_not_bill_again(flow, monkeypatch):
     monkeypatch.setenv("OPENMONTAGE_HEYGEN_STATE_DIR", str(flow.tmp / "state"))
-    first = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.tmp / "o.mp4")})
-    second = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.tmp / "o2.mp4")})
+    first = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.out / "o.mp4")})
+    second = HeyGenVideo().execute({"prompt": "same prompt", "output_path": str(flow.out / "o2.mp4")})
     assert first.success and second.success
     assert first.cost_usd > 0 and second.cost_usd == 0.0 and second.data["resumed"]
-    assert len(_creates(flow)) == 1 and (flow.tmp / "o2.mp4").read_bytes() == MP4
+    assert len(_creates(flow)) == 1 and (flow.out / "o2.mp4").read_bytes() == MP4
 
 
 def test_h4_video_id_is_saved_before_polling(flow, monkeypatch):
@@ -847,3 +848,106 @@ def test_f3_non_finite_created_at_is_ignored(flow, created):
     p.parent.mkdir(parents=True)
     p.write_text('{"idempotency_key": "a", "video_id": "v1", "created_at": %s}' % created)
     assert _shared._load_heygen_job("nankey") is None
+
+
+# ------------------------------------------------ Security flag F4: output_path confinement
+
+def test_f4_output_outside_roots_is_refused_before_any_call(flow):
+    victim = flow.tmp / "config.mp4"
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(victim)})
+    assert not out.success and "outside" in out.error
+    assert flow.log == [] and not victim.exists()
+    assert list(flow.tmp.glob("*.mp4*")) == []
+
+
+@pytest.mark.parametrize("rel", [
+    "../escaped.mp4",
+    "sub/../../escaped.mp4",
+])
+def test_f4_dotdot_traversal_is_refused(flow, rel):
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / rel)})
+    assert not out.success and "outside" in out.error and flow.log == []
+    assert not (flow.tmp / "escaped.mp4").exists()
+
+
+@pytest.mark.parametrize("path", ["/etc/cron.d/x.mp4", "/root/.ssh/authorized_keys", "~/.bashrc"])
+def test_f4_absolute_system_paths_are_refused(flow, path):
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": path})
+    assert not out.success and flow.log == []
+
+
+def test_f4_symlink_pointing_out_of_roots_is_refused(flow):
+    outside = flow.tmp / "outside.mp4"
+    outside.write_bytes(b"precious")
+    (flow.out / "link.mp4").symlink_to(outside)
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "link.mp4")})
+    assert not out.success and "outside" in out.error and flow.log == []
+    assert outside.read_bytes() == b"precious"
+
+
+def test_f4_symlinked_directory_out_of_roots_is_refused(flow):
+    outside_dir = flow.tmp / "elsewhere"
+    outside_dir.mkdir()
+    (flow.out / "d").symlink_to(outside_dir, target_is_directory=True)
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "d" / "x.mp4")})
+    assert not out.success and flow.log == [] and list(outside_dir.iterdir()) == []
+
+
+def test_f4_symlink_staying_inside_roots_is_allowed_and_written_at_the_target(flow):
+    (flow.out / "real.mp4").write_bytes(b"old")
+    (flow.out / "ok.mp4").symlink_to(flow.out / "real.mp4")
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "ok.mp4")})
+    assert out.success, out.error
+    assert (flow.out / "real.mp4").read_bytes() == MP4
+
+
+@pytest.mark.parametrize("name", ["clip.txt", "clip", "clip.mp4.sh", "clip.png"])
+def test_f4_only_mp4_names(flow, name):
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / name)})
+    assert not out.success and ".mp4" in out.error and flow.log == []
+
+
+def test_f4_directory_target_is_refused(flow):
+    (flow.out / "adir.mp4").mkdir()
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "adir.mp4")})
+    assert not out.success and "directory" in out.error and flow.log == []
+
+
+def test_f4_sibling_prefix_directory_is_not_inside(flow):
+    sibling = flow.tmp / "out-evil"
+    sibling.mkdir()
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(sibling / "x.mp4")})
+    assert not out.success and flow.log == []
+
+
+def test_f4_nested_new_directories_inside_roots_work(flow):
+    target = flow.out / "projects_x" / "assets" / "video" / "clip.mp4"
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(target)})
+    assert out.success, out.error
+    assert target.read_bytes() == MP4
+
+
+def test_f4_repo_projects_dir_is_allowed(monkeypatch):
+    monkeypatch.delenv("OPENMONTAGE_ASSET_DIR", raising=False)
+    p = _shared.validate_heygen_output_path("projects/demo/assets/video/x.mp4")
+    assert p.parts[-5:] == ("projects", "demo", "assets", "video", "x.mp4")
+    with pytest.raises(ValueError):
+        _shared.validate_heygen_output_path("elsewhere/x.mp4")
+
+
+def test_f4_tool_execute_reports_refusal_as_error(flow):
+    out = HeyGenVideo().execute({"prompt": "p", "output_path": str(flow.tmp / "x.mp4")})
+    assert not out.success and "outside" in out.error and flow.log == []
+
+
+def test_f4_asset_dir_env_accepts_several_entries(flow, monkeypatch, tmp_path):
+    other = tmp_path / "other_root"
+    other.mkdir()
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", os.pathsep.join([str(flow.out), str(other)]))
+    assert _shared.validate_heygen_output_path(other / "a.mp4") == (other / "a.mp4").resolve()
+    assert _shared.validate_heygen_output_path(flow.out / "a.mp4")
+
+
+def test_f4_missing_upload_file_outside_roots_does_not_reveal_existence(flow):
+    with pytest.raises(ValueError, match="outside"):          # not FileNotFoundError
+        _shared.validate_heygen_upload_path(str(flow.tmp / "does-not-exist.png"))

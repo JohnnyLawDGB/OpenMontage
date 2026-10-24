@@ -41,6 +41,7 @@ class Resp:
 def calls(monkeypatch, tmp_path):
     monkeypatch.setenv("HEYGEN_API_KEY", "test-not-a-key")
     monkeypatch.setenv("OPENMONTAGE_HEYGEN_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", str(tmp_path))
     monkeypatch.setattr(_shared.time, "sleep", lambda s: None)
     log = []
     polls = iter([{"data": {"status": "pending"}},
