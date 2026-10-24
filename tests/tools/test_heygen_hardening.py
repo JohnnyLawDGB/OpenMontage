@@ -339,7 +339,9 @@ def _creates(flow):
 
 
 def _run(flow, **inputs):
-    return _shared.generate_heygen_video({"prompt": "same prompt", "output_path": str(flow.out / "o.mp4"), **inputs})
+    return _shared.generate_heygen_video(
+        {"prompt": "same prompt", "output_path": str(flow.out / "o.mp4"), "overwrite": True, **inputs}
+    )
 
 
 def test_h4_key_fields_cover_the_create_request():
@@ -899,7 +901,7 @@ def test_f4_symlinked_directory_out_of_roots_is_refused(flow):
 def test_f4_symlink_staying_inside_roots_is_allowed_and_written_at_the_target(flow):
     (flow.out / "real.mp4").write_bytes(b"old")
     (flow.out / "ok.mp4").symlink_to(flow.out / "real.mp4")
-    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "ok.mp4")})
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "ok.mp4"), "overwrite": True})
     assert out.success, out.error
     assert (flow.out / "real.mp4").read_bytes() == MP4
 
@@ -1443,3 +1445,113 @@ def test_fc_download_confine_flag_defaults_off_for_direct_callers(monkeypatch, t
     with pytest.raises(_shared.OutputPathError):
         _shared.download_heygen_video(GOOD_URL, tmp_path / "o2.mp4", confine=True)
     assert not (tmp_path / "o2.mp4").exists()
+
+
+# ------------------------------------------------ Follow-up (d): an existing file is not overwritten unless overwrite=true
+
+def _gen(flow, **extra):
+    return _shared.generate_heygen_video({"prompt": "p", "output_path": str(flow.out / "keep.mp4"), **extra})
+
+
+def test_fd_existing_output_is_refused_before_any_call_and_left_untouched(flow):
+    (flow.out / "keep.mp4").write_bytes(b"precious")
+    out = _gen(flow)
+    assert not out.success and "overwrite" in out.error
+    assert flow.log == [] and (flow.out / "keep.mp4").read_bytes() == b"precious"
+    assert list(flow.out.glob("*.part")) == []
+
+
+def test_fd_new_file_is_written_without_overwrite_flag(flow):
+    out = _gen(flow)
+    assert out.success, out.error
+    assert (flow.out / "keep.mp4").read_bytes() == MP4
+    assert oct((flow.out / "keep.mp4").stat().st_mode & 0o777) == oct(0o644)
+    assert list(flow.out.glob("*.part")) == []
+
+
+def test_fd_overwrite_true_replaces(flow):
+    (flow.out / "keep.mp4").write_bytes(b"old")
+    out = _gen(flow, overwrite=True)
+    assert out.success, out.error
+    assert (flow.out / "keep.mp4").read_bytes() == MP4
+
+
+@pytest.mark.parametrize("val", [False, None, "true", "1", 1, "yes", [], {}])
+def test_fd_only_boolean_true_counts_as_overwrite(flow, val):
+    (flow.out / "keep.mp4").write_bytes(b"old")
+    out = _gen(flow, overwrite=val)
+    assert not out.success and flow.log == [] and (flow.out / "keep.mp4").read_bytes() == b"old"
+
+
+def test_fd_symlink_to_an_existing_file_counts_as_existing(flow):
+    (flow.out / "real.mp4").write_bytes(b"old")
+    (flow.out / "keep.mp4").symlink_to(flow.out / "real.mp4")
+    out = _gen(flow)
+    assert not out.success and (flow.out / "real.mp4").read_bytes() == b"old" and flow.log == []
+
+
+def test_fd_rerun_of_a_finished_request_is_refused_then_allowed_with_overwrite_and_never_recreates(flow):
+    assert _gen(flow).success
+    again = _gen(flow)
+    assert not again.success and "overwrite" in again.error
+    assert len(_creates(flow)) == 1
+    third = _gen(flow, overwrite=True)
+    assert third.success and third.data["resumed"] and len(_creates(flow)) == 1
+
+
+def test_fd_default_output_name_is_not_subject_to_the_check(flow, monkeypatch):
+    monkeypatch.setattr(_shared, "_heygen_default_output_dir", lambda: flow.out)
+    (flow.out / "heygen_video_vid_1.mp4").write_bytes(b"same video, earlier download")
+    out = _shared.generate_heygen_video({"prompt": "p"})
+    assert out.success, out.error
+    assert (flow.out / "heygen_video_vid_1.mp4").read_bytes() == MP4
+
+
+def test_fd_file_appearing_during_the_download_is_not_clobbered(flow, monkeypatch):
+    target = flow.out / "keep.mp4"
+
+    class CreateMidStream(Resp):
+        def iter_content(self, chunk_size=1):
+            yield MP4
+            target.write_bytes(b"made by someone else meanwhile")
+
+    monkeypatch.setattr("requests.get", lambda url, **kw: (
+        Resp({"data": {"status": "completed", "video_url": GOOD_URL}}) if url.startswith("https://api.") else CreateMidStream()))
+    out = _gen(flow)
+    assert not out.success and "overwrite" in out.error
+    assert target.read_bytes() == b"made by someone else meanwhile"
+    assert list(flow.out.glob("*.part")) == []
+
+
+def test_fd_download_function_overwrite_false(monkeypatch, tmp_path):
+    (tmp_path / "o.mp4").write_bytes(b"old")
+    _get_returning(monkeypatch, Resp())
+    with pytest.raises(_shared.OutputPathError, match="overwrite"):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4", overwrite=False)
+    assert (tmp_path / "o.mp4").read_bytes() == b"old" and [p.name for p in tmp_path.iterdir()] == ["o.mp4"]
+    _get_returning(monkeypatch, Resp())
+    assert _shared.download_heygen_video(GOOD_URL, tmp_path / "new.mp4", overwrite=False) == len(MP4)
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".part")] == []
+    _get_returning(monkeypatch, Resp())
+    assert _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4") == len(MP4)      # default keeps the old behaviour
+    assert (tmp_path / "o.mp4").read_bytes() == MP4
+
+
+def test_fd_filesystem_without_hard_links_falls_back_but_still_refuses_existing(monkeypatch, tmp_path):
+    def no_link(*a, **k):
+        raise PermissionError("hard links not supported")
+
+    monkeypatch.setattr(_shared.os, "link", no_link)
+    _get_returning(monkeypatch, Resp())
+    assert _shared.download_heygen_video(GOOD_URL, tmp_path / "new.mp4", overwrite=False) == len(MP4)
+    assert (tmp_path / "new.mp4").read_bytes() == MP4
+    _get_returning(monkeypatch, Resp())
+    with pytest.raises(_shared.OutputPathError):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "new.mp4", overwrite=False)
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".part")] == []
+
+
+def test_fd_tool_schema_documents_overwrite():
+    props = HeyGenVideo.input_schema["properties"]
+    assert props["overwrite"]["type"] == "boolean" and props["overwrite"]["default"] is False
+    assert "never overwritten" in props["output_path"]["description"]

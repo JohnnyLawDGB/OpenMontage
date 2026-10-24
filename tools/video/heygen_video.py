@@ -94,7 +94,18 @@ class HeyGenVideo(BaseTool):
             },
             "duration": {"type": "integer", "minimum": 5, "maximum": 15, "default": 5},
             "resolution": {"type": "string", "enum": ["480p", "768p", "1080p", "2k"], "default": "768p"},
-            "output_path": {"type": "string"},
+            "output_path": {
+                "type": "string",
+                "description": (
+                    "Where to write the mp4. Must be inside projects/, assets/ or OPENMONTAGE_ASSET_DIR "
+                    "and end in .mp4. An existing file is never overwritten unless overwrite is true."
+                ),
+            },
+            "overwrite": {
+                "type": "boolean",
+                "default": False,
+                "description": "Replace an existing file at output_path (default: refuse).",
+            },
         },
     }
 

@@ -660,18 +660,36 @@ def _refusal(url: str) -> ValueError:
     return ValueError("Refusing HeyGen video download (url not allowed)")
 
 
+def _link_no_overwrite(tmp: Path, dest: Path) -> None:
+    """Give tmp the name dest unless dest exists (atomic where hard links work)."""
+    try:
+        os.link(tmp, dest)
+    except FileExistsError:
+        raise OutputPathError(
+            f"Refusing to overwrite existing {dest.name}: output_path already exists "
+            "(pass overwrite=true to replace it, or choose another path)"
+        ) from None
+    except OSError:  # no hard links on this filesystem: best effort
+        if dest.exists():
+            raise OutputPathError(f"Refusing to overwrite existing {dest.name}: output_path already exists") from None
+        os.replace(tmp, dest)
+
+
 def download_heygen_video(
     video_url: str,
     output_path: Path,
     max_bytes: int = HEYGEN_MAX_DOWNLOAD_BYTES,
     confine: bool = False,
+    overwrite: bool = True,
 ) -> int:
     """Download a completed HeyGen video to output_path and return its size.
 
     With confine=True the destination is validated again (validate_heygen_output_path)
     before the first request and again right before the final rename, because polling
     and the download can take many minutes and a directory on the path may have been
-    replaced by a symlink in the meantime.
+    replaced by a symlink in the meantime. With overwrite=False an existing file is
+    never replaced: the final step is an atomic hard link that fails if the name exists
+    (a plain exists() check followed by a rename when the filesystem has no hard links).
 
     https only, host allowlist and parser agreement (re-checked on every redirect), streamed to a
     .part file with a size cap. No API key is sent. The URL is never put in an
@@ -680,7 +698,7 @@ def download_heygen_video(
     import requests
 
     if confine:
-        output_path = validate_heygen_output_path(output_path)
+        output_path = validate_heygen_output_path(output_path, overwrite=overwrite)
     url = video_url
     for _ in range(HEYGEN_MAX_REDIRECTS + 1):
         if not _heygen_download_url_ok(url):  # initial URL and every redirect hop
@@ -741,9 +759,13 @@ def download_heygen_video(
                 if head[4:8] != b"ftyp":  # every mp4 starts with a size field then 'ftyp'
                     raise ValueError("HeyGen video download is not an mp4 file")
                 if confine:
-                    output_path = validate_heygen_output_path(output_path)
+                    output_path = validate_heygen_output_path(output_path, overwrite=overwrite)
                 os.chmod(tmp, 0o644)  # mkstemp creates 0600; keep the usual mode for a media file
-                os.replace(tmp, output_path)
+                if overwrite:
+                    os.replace(tmp, output_path)
+                else:
+                    _link_no_overwrite(tmp, output_path)
+                    tmp.unlink(missing_ok=True)
             except BaseException:
                 tmp.unlink(missing_ok=True)
                 raise
@@ -837,11 +859,12 @@ class OutputPathError(ValueError):
     """output_path is not allowed (outside the asset roots, wrong suffix, a directory, exists)."""
 
 
-def validate_heygen_output_path(output_path: str | Path) -> Path:
-    """Return the resolved path a HeyGen video may be written to, or raise ValueError.
+def validate_heygen_output_path(output_path: str | Path, overwrite: bool = True) -> Path:
+    """Return the resolved path a HeyGen video may be written to, or raise OutputPathError.
 
     The path must resolve (symlinks followed, so a link pointing out of the roots is
-    refused) inside the allowed asset roots, end in .mp4 and not be a directory.
+    refused) inside the allowed asset roots, end in .mp4 and not be a directory. With
+    overwrite=False an existing file at the resolved path is refused too.
     """
     resolved = Path(output_path).resolve()
     if not any(resolved.is_relative_to(root) for root in _allowed_asset_roots()):
@@ -850,6 +873,11 @@ def validate_heygen_output_path(output_path: str | Path) -> Path:
         raise OutputPathError(f"Refusing to write {resolved.name}: output_path must end in .mp4")
     if resolved.is_dir():
         raise OutputPathError(f"Refusing to write {resolved.name}: output_path is a directory")
+    if not overwrite and resolved.exists():
+        raise OutputPathError(
+            f"Refusing to overwrite existing {resolved.name}: output_path already exists "
+            "(pass overwrite=true to replace it, or choose another path)"
+        )
     return resolved
 
 
@@ -979,9 +1007,12 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
         )
 
     # Confine the output file before anything is created or billed.
+    # An explicit output_path is never overwritten unless overwrite=true; the default name
+    # contains the video id, so re-downloading the same video to it is harmless.
     custom_output = inputs.get("output_path")
+    overwrite = not custom_output or inputs.get("overwrite") is True
     try:
-        output_path = validate_heygen_output_path(custom_output) if custom_output else None
+        output_path = validate_heygen_output_path(custom_output, overwrite=overwrite) if custom_output else None
     except OutputPathError as exc:
         return ToolResult(success=False, error=str(exc))
 
@@ -1069,8 +1100,8 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     # (and download_heygen_video checks once more just before the rename). The video id stays
     # saved, so after fixing the path a re-run downloads it without creating a new video.
     try:
-        output_path = validate_heygen_output_path(output_path)
-        download_heygen_video(video_url, output_path, confine=True)
+        output_path = validate_heygen_output_path(output_path, overwrite=overwrite)
+        download_heygen_video(video_url, output_path, confine=True, overwrite=overwrite)
     except OutputPathError as exc:
         return ToolResult(success=False, error=f"{exc}. The HeyGen video {execution_id} is kept; re-run to download it")
 
