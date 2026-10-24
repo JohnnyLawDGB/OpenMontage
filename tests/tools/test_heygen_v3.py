@@ -21,6 +21,13 @@ REPO = Path(__file__).resolve().parents[2]
 class Resp:
     def __init__(self, payload=None, status=200, content=b"MP4"):
         self._p, self.status_code, self.content = payload or {}, status, content
+        self.headers = {}
+
+    def iter_content(self, chunk_size=1):
+        yield self.content
+
+    def close(self):
+        pass
 
     def json(self):
         return self._p
@@ -36,7 +43,7 @@ def calls(monkeypatch):
     monkeypatch.setattr(_shared.time, "sleep", lambda s: None)
     log = []
     polls = iter([{"data": {"status": "pending"}},
-                  {"data": {"status": "completed", "video_url": "https://cdn.example/v.mp4"}}])
+                  {"data": {"status": "completed", "video_url": "https://resource2.heygen.ai/v.mp4"}}])
 
     def post(url, **kw):
         log.append(("POST", url, kw))
@@ -46,7 +53,7 @@ def calls(monkeypatch):
 
     def get(url, **kw):
         log.append(("GET", url, kw))
-        if "cdn.example" in url:
+        if "resource2.heygen.ai" in url:
             return Resp(content=b"MP4")
         return Resp(next(polls))
 

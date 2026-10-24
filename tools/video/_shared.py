@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from tools.base_tool import ToolResult, ToolStatus
 
@@ -370,6 +372,74 @@ def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
     raise TimeoutError(f"HeyGen video {video_id} timed out after {timeout}s")
 
 
+# Hosts the completed video_url may be fetched from: HeyGen's own CDN
+# (docs show resource2.heygen.ai). Extra exact hosts can be added with
+# HEYGEN_EXTRA_DOWNLOAD_HOSTS (comma separated) if a real response uses another one.
+HEYGEN_DOWNLOAD_HOST_SUFFIXES = ("heygen.ai", "heygen.com")
+HEYGEN_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+HEYGEN_MAX_REDIRECTS = 3
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+
+def _heygen_download_host_allowed(host: str | None) -> bool:
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    extra = {h.strip().lower() for h in os.environ.get("HEYGEN_EXTRA_DOWNLOAD_HOSTS", "").split(",") if h.strip()}
+    return host in extra or any(host == s or host.endswith("." + s) for s in HEYGEN_DOWNLOAD_HOST_SUFFIXES)
+
+
+def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HEYGEN_MAX_DOWNLOAD_BYTES) -> int:
+    """Download a completed HeyGen video to output_path and return its size.
+
+    https only, host allowlist (re-checked on every redirect), streamed to a
+    .part file with a size cap. No API key is sent. The URL is never put in an
+    error message because it is a signed URL.
+    """
+    import requests
+
+    url = video_url
+    for _ in range(HEYGEN_MAX_REDIRECTS + 1):
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not _heygen_download_host_allowed(parts.hostname):
+            raise ValueError(f"Refusing HeyGen video download from {parts.scheme}://{parts.hostname}")
+        resp = requests.get(url, stream=True, timeout=120, allow_redirects=False)
+        try:
+            if resp.status_code in _REDIRECT_CODES:
+                location = resp.headers.get("Location")
+                if not location:
+                    raise RuntimeError("HeyGen video download redirect without Location")
+                url = urljoin(url, location)
+                continue
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ctype and not (ctype.startswith("video/") or ctype == "application/octet-stream"):
+                raise ValueError(f"Unexpected content type for HeyGen video download: {ctype}")
+            declared = resp.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError(f"HeyGen video is larger than the {max_bytes} byte limit")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = output_path.with_name(output_path.name + ".part")
+            written = 0
+            try:
+                with tmp.open("wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        written += len(chunk)
+                        if written > max_bytes:
+                            raise ValueError(f"HeyGen video exceeded the {max_bytes} byte limit")
+                        fh.write(chunk)
+                if written == 0:
+                    raise RuntimeError("HeyGen video download was empty")
+                tmp.replace(output_path)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            return written
+        finally:
+            resp.close()
+    raise RuntimeError("Too many redirects downloading HeyGen video")
+
+
 def upload_image_fal(image_path: str) -> str:
     """Upload a local image to fal.ai storage and return a public URL."""
     import requests
@@ -504,10 +574,7 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
 
     video_url = poll_heygen(execution_id, api_key, timeout=600)
     output_path = Path(inputs.get("output_path", f"heygen_video_{execution_id}.mp4"))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    download = requests.get(video_url, timeout=120)
-    download.raise_for_status()
-    output_path.write_bytes(download.content)
+    download_heygen_video(video_url, output_path)
 
     meta = HEYGEN_PROVIDERS[provider]
     return ToolResult(
