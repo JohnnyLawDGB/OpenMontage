@@ -1048,17 +1048,17 @@ def test_f5_heygen_fallback_path_still_works_with_validated_fal(flow, assets, mo
 # ------------------------------------------------ Low F6: reference_image_url is vetted
 
 @pytest.mark.parametrize("url", [
-    "http://img.example/a.png",
-    "ftp://img.example/a.png",
+    "http://images.shopfront.com/a.png",
+    "ftp://images.shopfront.com/a.png",
     "file:///etc/passwd",
-    "//img.example/a.png",
-    "img.example/a.png",
-    "https://user:pw@img.example/a.png",
-    "https://evil.tld\\@img.example/a.png",
-    "https://img.example:8443/a.png",
-    "https://img.example/a b.png",
-    "https://img.example/a.png\n",
-    "https://img.example/" + "a" * 2050,
+    "//images.shopfront.com/a.png",
+    "images.shopfront.com/a.png",
+    "https://user:pw@images.shopfront.com/a.png",
+    "https://evil.tld\\@images.shopfront.com/a.png",
+    "https://images.shopfront.com:8443/a.png",
+    "https://images.shopfront.com/a b.png",
+    "https://images.shopfront.com/a.png\n",
+    "https://images.shopfront.com/" + "a" * 2050,
     "https://ｉmg.example/a.png",
     123,
 ])
@@ -1070,7 +1070,7 @@ def test_f6_bad_reference_urls_are_refused_before_any_call(flow, url):
         assert url[:40] not in out.error      # the URL is not echoed
 
 
-@pytest.mark.parametrize("url", ["https://img.example/a.png", "https://img.example:443/a.png?x=1&y=%20"])
+@pytest.mark.parametrize("url", ["https://images.shopfront.com/a.png", "https://images.shopfront.com:443/a.png?x=1&y=%20"])
 def test_f6_plain_https_reference_url_is_sent_as_is(flow, url):
     out = _run(flow, operation="image_to_video", reference_image_url=url)
     assert out.success, out.error
@@ -1201,3 +1201,73 @@ def test_f12_estimate_cost_is_3x_for_1080p_and_2k(res, factor):
     inputs = {"prompt": "p", **({"resolution": res} if res else {})}
     assert tool.estimate_cost(inputs) == pytest.approx(base * factor)
     assert base > 0
+
+
+# ------------------------------------------------ Follow-up (a): reference_image_url must look public
+
+@pytest.mark.parametrize("url", [
+    "https://127.0.0.1/a.png", "https://10.0.0.5/a.png", "https://169.254.169.254/latest/meta-data/",
+    "https://[::1]/a.png", "https://[fe80::1]/a.png", "https://[2001:db8::1]/a.png",
+    "https://2130706433/a.png", "https://0x7f000001/a.png", "https://127.1/a.png", "https://017700000001/a.png",
+    "https://0x7f.0.0.1/a.png", "https://1.2.3.4.5/a.png",
+    "https://localhost/a.png", "https://localhost./a.png", "https://LOCALHOST/a.png", "https://app.localhost/a.png",
+    "https://intranet/a.png", "https://printer/a.png",
+    "https://nas.local/a.png", "https://db.internal/a.png", "https://router.lan/a.png", "https://x.corp/a.png",
+    "https://metadata.google.internal/a.png", "https://host.home/a.png", "https://a.example/a.png",
+    "https://-bad.example.com/a.png", "https://a..com/a.png", "https://site.c0m/a.png",
+])
+def test_fa_non_public_looking_hosts_are_refused(flow, url):
+    out = _run(flow, operation="image_to_video", reference_image_url=url)
+    assert not out.success and "reference_image_url" in out.error and flow.log == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://images.shopfront.com/a.png?token=abc",
+    "https://images.shopfront.com/a.png?access_token=abc",
+    "https://images.shopfront.com/a.png?API_KEY=abc",
+    "https://images.shopfront.com/a.png?apikey=abc",
+    "https://images.shopfront.com/a.png?key=abc",
+    "https://images.shopfront.com/a.png?secret=abc",
+    "https://images.shopfront.com/a.png?password=abc",
+    "https://images.shopfront.com/a.png?sig=abc",
+    "https://images.shopfront.com/a.png?signature=abc",
+    "https://images.shopfront.com/a.png?X-Amz-Signature=abc",
+    "https://images.shopfront.com/a.png?X-Amz-Credential=abc",
+    "https://images.shopfront.com/a.png?X-Goog-Signature=abc",
+    "https://images.shopfront.com/a.png?auth=abc",
+    "https://images.shopfront.com/a.png?w=1&session=abc",
+    "https://images.shopfront.com/a.png?x=sk-abcdef",
+    "https://images.shopfront.com/a.png?x=ghp_abcdef",
+    "https://images.shopfront.com/a.png?x=eyJhbGciOi",
+    "https://images.shopfront.com/a.png?x=AKIAABCDEFG",
+    "https://images.shopfront.com/a.png?" + "a=b&" * 200,
+    "https://images.shopfront.com/a.png#frag",
+])
+def test_fa_secret_looking_query_strings_are_refused_and_not_echoed(flow, url):
+    out = _run(flow, operation="image_to_video", reference_image_url=url)
+    assert not out.success and "reference_image_url" in out.error and flow.log == []
+    assert "abc" not in out.error and "?" not in out.error.split("DNS name")[0]
+    assert "reference_image_path" in out.error            # tells the user what to do instead
+
+
+@pytest.mark.parametrize("url", [
+    "https://images.shopfront.com/a.png",
+    "https://cdn.shopfront.co.uk/a/b/c.jpg?w=800&h=600",
+    "https://images.shopfront.com/a.png?v=3&format=webp&keyword=sunset",
+    "https://xn--bcher-kva.example.com/a.png",
+    "https://resource2.heygen.ai/image/x.png",
+    "https://a.b.c.d.com/x.png?size=large",
+    "https://shop.com:443/a.png",
+    "https://images.shopfront.com/assets/token-icon.png",     # a path may mention words; only the query is checked
+    "https://images.shopfront.com/a.png?monkey=1&author=me&keyword=x&design=2",  # substrings of longer, harmless names
+])
+def test_fa_ordinary_public_urls_still_work(flow, url):
+    out = _run(flow, operation="image_to_video", reference_image_url=url)
+    assert out.success, out.error
+    assert _creates(flow)[0][2]["json"]["image"] == {"type": "url", "url": url}
+
+
+def test_fa_reference_url_check_is_pure_syntax_no_dns(monkeypatch):
+    import socket
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: pytest.fail("no DNS lookups"))
+    assert _shared._reference_url_ok("https://images.shopfront.com/a.png")

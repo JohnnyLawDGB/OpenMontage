@@ -400,6 +400,21 @@ def heygen_idempotency_key(inputs: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
+def _ensure_state_dir(path: Path) -> None:
+    """Create the job-state directory (0700). An existing one that is group/world
+    accessible is tightened to 0700; one owned by another user is refused, because that
+    user could replace job files (and so pick which video a re-run downloads)."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "nt":
+        return
+    st = path.stat()
+    if st.st_uid != os.getuid():
+        raise PermissionError("HeyGen job-state directory is owned by another user; set OPENMONTAGE_HEYGEN_STATE_DIR")
+    if st.st_mode & 0o077:
+        path.chmod(0o700)
+        logger.warning("Tightened permissions of the HeyGen job-state directory %s to 0700", path)
+
+
 def _heygen_job_path(key: str) -> Path:
     base = os.environ.get("OPENMONTAGE_HEYGEN_STATE_DIR")
     root = Path(base).expanduser() if base else Path.home() / ".openmontage" / "heygen_jobs"
@@ -426,7 +441,7 @@ def _save_heygen_job(key: str, job: dict[str, Any]) -> None:
     """Write the job file atomically: unique temp file (mode 0600) in the same
     directory, then rename. The directory is created with mode 0700."""
     path = _heygen_job_path(key)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_state_dir(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
@@ -442,9 +457,13 @@ def _heygen_job_lock(key: str, timeout: float = 180.0):
     """Exclusive advisory lock for one request key (a <key>.lock file next to the job
     file), so two runs with the same key cannot both create a video. Held from the
     job load until the video_id is saved, not while polling. Released by the OS if the
-    process dies."""
+    process dies.
+
+    NOTE: the POSIX branch (fcntl.flock) is covered by thread and process tests. The
+    Windows branch (msvcrt.locking on one byte) has NOT been tested; treat it as
+    unverified until someone runs the concurrency tests on Windows."""
     path = _heygen_job_path(key).with_suffix(".lock")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _ensure_state_dir(path.parent)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     deadline = time.monotonic() + timeout
     try:
@@ -564,6 +583,57 @@ def _https_url_syntax_ok(url: str) -> bool:
         return False
     host = (p.hostname or "").lower()
     return bool(host) and (q.host or "").lower() == host and q.scheme == "https" and q.auth is None
+
+
+_LOCAL_SUFFIXES = (
+    ".localhost", ".local", ".localdomain", ".internal", ".intranet", ".lan", ".home", ".corp",
+    ".private", ".test", ".example", ".invalid", ".arpa", ".onion",
+)
+_SECRET_PARAM_RE = re.compile(
+    r".*(token|secret|passw|pwd|api[-_]?key|access[-_]?key|credential|signature|bearer|jwt).*"
+    r"|(x-amz-|x-goog-|x-ms-).*"
+    r"|(key|sig|auth|authorization|authkey|session|sessionid|sid)",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_RE = re.compile(r"^(sk-|sk_|ghp_|gho_|github_pat_|xox[abp]-|AKIA|ASIA|eyJ|Bearer)", re.IGNORECASE)
+_REFERENCE_URL_MAX_QUERY = 512
+
+
+def _reference_url_ok(url: Any) -> bool:
+    """True if url is a plain https URL to a public-looking DNS name that HeyGen may fetch.
+
+    Rejects: anything _https_url_syntax_ok rejects; IP literals (including decimal, hex
+    and short forms such as 2130706433 or 127.1); localhost and other single-label or
+    local-only names (.local, .internal, .lan, ...); a top-level label that is not
+    alphabetic; fragments; long queries; and query parameters that look like secrets
+    (token, key, signature, auth, ... or values such as sk-, ghp_, eyJ). Plain queries
+    such as ?w=800 or ?v=3 are allowed. This cannot tell whether a public name resolves
+    to a private address; HeyGen, not this process, fetches the URL.
+    """
+    import ipaddress
+    from urllib.parse import parse_qsl
+
+    if not isinstance(url, str) or not _https_url_syntax_ok(url):
+        return False
+    p = urlsplit(url)
+    host = (p.hostname or "").lower().rstrip(".")
+    if p.fragment or len(p.query) > _REFERENCE_URL_MAX_QUERY or "." not in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    labels = host.split(".")
+    tld = labels[-1]
+    if not (re.fullmatch(r"[a-z]{2,63}", tld) or re.fullmatch(r"xn--[a-z0-9-]{1,59}", tld)):
+        return False  # numeric last label: 127.1, 0x7f.1, 1.2.3.4.5
+    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES) or any(not lbl or lbl.startswith("-") or lbl.endswith("-") for lbl in labels):
+        return False
+    for name, value in parse_qsl(p.query, keep_blank_values=True):
+        if _SECRET_PARAM_RE.fullmatch(name) or _SECRET_VALUE_RE.match(value):
+            return False
+    return True
 
 
 def _heygen_download_url_ok(url: str) -> bool:
@@ -879,13 +949,14 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
 
     ref_url = inputs.get("reference_image_url")
     if operation == "image_to_video" and ref_url and not (
-        isinstance(ref_url, str) and len(ref_url) <= 2048 and _https_url_syntax_ok(ref_url)
+        isinstance(ref_url, str) and len(ref_url) <= 2048 and _reference_url_ok(ref_url)
     ):
         return ToolResult(
             success=False,
             error=(
-                "reference_image_url must be a plain https URL of at most 2048 characters "
-                "(no userinfo, backslash, whitespace or custom port)"
+                "reference_image_url must be a plain https URL of at most 2048 characters to a public "
+                "DNS name (no IP address, localhost, userinfo, port, fragment, or token/key/signature "
+                "query parameters). For a private image use reference_image_path, which uploads it to HeyGen."
             ),
         )
 
