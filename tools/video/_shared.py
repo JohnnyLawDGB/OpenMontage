@@ -845,6 +845,18 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
             error=f"HeyGen renders {inputs['resolution']} only in 16:9 or 9:16 for text_to_video, not {aspect_ratio}",
         )
 
+    ref_url = inputs.get("reference_image_url")
+    if operation == "image_to_video" and ref_url and not (
+        isinstance(ref_url, str) and len(ref_url) <= 2048 and _https_url_syntax_ok(ref_url)
+    ):
+        return ToolResult(
+            success=False,
+            error=(
+                "reference_image_url must be a plain https URL of at most 2048 characters "
+                "(no userinfo, backslash, whitespace or custom port)"
+            ),
+        )
+
     # Confine the output file before anything is created or billed.
     custom_output = inputs.get("output_path")
     try:

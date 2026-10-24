@@ -1042,3 +1042,39 @@ def test_f5_heygen_fallback_path_still_works_with_validated_fal(flow, assets, mo
     monkeypatch.setenv("FAL_KEY", "test-not-a-fal-key")
     monkeypatch.setenv("HEYGEN_ALLOW_FAL_FALLBACK", "1")
     assert _shared.upload_image_heygen(str(p), "k") == {"type": "url", "url": "https://fal.example/f.png"}
+
+
+# ------------------------------------------------ Low F6: reference_image_url is vetted
+
+@pytest.mark.parametrize("url", [
+    "http://img.example/a.png",
+    "ftp://img.example/a.png",
+    "file:///etc/passwd",
+    "//img.example/a.png",
+    "img.example/a.png",
+    "https://user:pw@img.example/a.png",
+    "https://evil.tld\\@img.example/a.png",
+    "https://img.example:8443/a.png",
+    "https://img.example/a b.png",
+    "https://img.example/a.png\n",
+    "https://img.example/" + "a" * 2050,
+    "https://ｉmg.example/a.png",
+    123,
+])
+def test_f6_bad_reference_urls_are_refused_before_any_call(flow, url):
+    out = _run(flow, operation="image_to_video", reference_image_url=url)
+    assert not out.success and "reference_image_url" in out.error
+    assert flow.log == []
+    if isinstance(url, str) and url:
+        assert url[:40] not in out.error      # the URL is not echoed
+
+
+@pytest.mark.parametrize("url", ["https://img.example/a.png", "https://img.example:443/a.png?x=1&y=%20"])
+def test_f6_plain_https_reference_url_is_sent_as_is(flow, url):
+    out = _run(flow, operation="image_to_video", reference_image_url=url)
+    assert out.success, out.error
+    assert _creates(flow)[0][2]["json"]["image"] == {"type": "url", "url": url}
+
+
+def test_f6_text_to_video_ignores_the_field(flow):
+    assert _run(flow, reference_image_url="http://bad.example/").success
