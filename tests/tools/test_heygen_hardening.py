@@ -1555,3 +1555,62 @@ def test_fd_tool_schema_documents_overwrite():
     props = HeyGenVideo.input_schema["properties"]
     assert props["overwrite"]["type"] == "boolean" and props["overwrite"]["default"] is False
     assert "never overwritten" in props["output_path"]["description"]
+
+
+# ------------------------------------------------ Follow-up (e): an existing state directory is tightened to 0700
+
+def _mode(p: Path) -> int:
+    return p.stat().st_mode & 0o777
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+@pytest.mark.parametrize("start", [0o755, 0o777, 0o750, 0o705, 0o770])
+def test_fe_existing_lax_state_dir_is_tightened_on_save_and_lock(flow, caplog, start):
+    state = flow.tmp / "state"
+    state.mkdir()
+    state.chmod(start)
+    with caplog.at_level("WARNING"):
+        _shared._save_heygen_job("k1", {"idempotency_key": "a", "created_at": time.time()})
+    assert _mode(state) == 0o700 and "Tightened" in caplog.text
+    state.chmod(start)
+    with _shared._heygen_job_lock("k2"):
+        assert _mode(state) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_fe_state_dir_is_tightened_by_a_normal_run_and_files_are_private(flow):
+    state = flow.tmp / "state"
+    state.mkdir()
+    state.chmod(0o755)
+    assert _run(flow).success
+    assert _mode(state) == 0o700
+    assert all(_mode(p) & 0o077 == 0 for p in state.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_fe_already_private_dir_is_left_alone_without_a_warning(flow, caplog):
+    state = flow.tmp / "state"
+    state.mkdir()
+    state.chmod(0o700)
+    with caplog.at_level("WARNING"):
+        _shared._save_heygen_job("k1", {"idempotency_key": "a", "created_at": time.time()})
+    assert _mode(state) == 0o700 and "Tightened" not in caplog.text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_fe_new_state_dir_is_0700_even_with_a_permissive_umask(flow):
+    old = os.umask(0o000)
+    try:
+        _shared._save_heygen_job("k1", {"idempotency_key": "a", "created_at": time.time()})
+    finally:
+        os.umask(old)
+    assert _mode(flow.tmp / "state") == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
+def test_fe_state_dir_owned_by_someone_else_is_refused_before_any_call(flow, monkeypatch):
+    (flow.tmp / "state").mkdir()
+    monkeypatch.setattr(_shared.os, "getuid", lambda: os.stat(flow.tmp / "state").st_uid + 1)
+    with pytest.raises(PermissionError, match="owned by another user"):
+        _run(flow)
+    assert flow.log == [] and _mode(flow.tmp / "state") != 0o000
