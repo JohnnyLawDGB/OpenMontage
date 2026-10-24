@@ -76,9 +76,10 @@ def test_text_to_video_uses_v3_models_videos(calls, tmp_path):
     assert not any(LEGACY.search(c[1]) for c in calls)
 
 
-def test_image_to_video_uploads_via_v3_assets(calls, tmp_path):
+def test_image_to_video_uploads_via_v3_assets(calls, tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", str(tmp_path))
     img = tmp_path / "f.png"
-    img.write_bytes(b"\x89PNG")
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 8)
     r = HeyGenVideo().execute({"prompt": "zoom", "operation": "image_to_video",
                                "reference_image_path": str(img), "output_path": str(tmp_path / "o.mp4")})
     assert r.success, r.error

@@ -198,3 +198,120 @@ def test_h2_default_filename_uses_validated_id(flow, monkeypatch):
     assert out.success, out.error
     assert out.artifacts == ["heygen_video_vid_1.mp4"]
     assert (flow.tmp / "heygen_video_vid_1.mp4").read_bytes() == b"MP4"
+
+
+# ---------------------------------------------------------------- H3
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 8
+JPEG = b"\xff\xd8\xff\xe0" + b"0" * 12
+WEBP = b"RIFF\x00\x00\x00\x00WEBP" + b"0" * 4
+
+
+@pytest.fixture
+def assets(monkeypatch, tmp_path):
+    d = tmp_path / "assets_dir"
+    d.mkdir()
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", str(d))
+    return d
+
+
+def _posts(flow):
+    return [c for c in flow.log if c[0] == "POST"]
+
+
+def test_h3_path_outside_asset_dir_is_refused_and_nothing_is_sent(flow, assets):
+    secret = flow.tmp / "id_rsa.png"          # right extension and magic bytes, wrong place
+    secret.write_bytes(PNG)
+    with pytest.raises(ValueError, match="outside"):
+        _shared.upload_image_heygen(str(secret), "k")
+    traversal = assets / ".." / "id_rsa.png"
+    with pytest.raises(ValueError, match="outside"):
+        _shared.upload_image_heygen(str(traversal), "k")
+    assert flow.log == []
+
+
+def test_h3_symlink_out_of_asset_dir_is_refused(flow, assets):
+    target = flow.tmp / "outside.png"
+    target.write_bytes(PNG)
+    (assets / "link.png").symlink_to(target)
+    with pytest.raises(ValueError, match="outside"):
+        _shared.upload_image_heygen(str(assets / "link.png"), "k")
+    assert flow.log == []
+
+
+@pytest.mark.parametrize("name,data,match", [
+    ("id_rsa", PNG, "only png"),
+    ("notes.txt", PNG, "only png"),
+    ("fake.png", b"not an image at all", "does not match"),
+    ("really_png.jpg", PNG, "does not match"),
+    ("empty.png", b"", "size"),
+])
+def test_h3_extension_magic_bytes_and_size_checks(flow, assets, name, data, match):
+    p = assets / name
+    p.write_bytes(data)
+    with pytest.raises(ValueError, match=match):
+        _shared.upload_image_heygen(str(p), "k")
+    assert flow.log == []
+
+
+def test_h3_size_cap(flow, assets, monkeypatch):
+    p = assets / "big.png"
+    p.write_bytes(PNG)
+    monkeypatch.setattr(_shared, "HEYGEN_MAX_UPLOAD_BYTES", 10)
+    with pytest.raises(ValueError, match="size"):
+        _shared.upload_image_heygen(str(p), "k")
+
+
+@pytest.mark.parametrize("name,data,ctype", [
+    ("a.png", PNG, "image/png"), ("a.jpg", JPEG, "image/jpeg"),
+    ("a.JPEG", JPEG, "image/jpeg"), ("a.webp", WEBP, "image/webp"),
+])
+def test_h3_content_type_comes_from_magic_bytes(flow, assets, name, data, ctype):
+    p = assets / name
+    p.write_bytes(data)
+    assert _shared.upload_image_heygen(str(p), "k") == {"type": "asset_id", "asset_id": "asset_1"}
+    (_, url, kw), = _posts(flow)
+    assert url == "https://api.heygen.com/v3/assets"
+    assert kw["files"]["file"][0] == p.name and kw["files"]["file"][2] == ctype
+
+
+def _failing_assets(monkeypatch, how):
+    def post(url, **kw):
+        if how == "raise":
+            raise ConnectionError("boom")
+        return Resp({}, status=500)
+
+    monkeypatch.setattr("requests.post", post)
+
+
+@pytest.mark.parametrize("how", ["raise", "http500"])
+def test_h3_fal_fallback_is_off_by_default(flow, assets, monkeypatch, how):
+    p = assets / "a.png"
+    p.write_bytes(PNG)
+    _failing_assets(monkeypatch, how)
+    monkeypatch.setattr(_shared, "upload_image_fal", lambda path: pytest.fail("public upload must not happen"))
+    with pytest.raises(RuntimeError, match="HEYGEN_ALLOW_FAL_FALLBACK"):
+        _shared.upload_image_heygen(str(p), "test-not-a-key")
+
+
+def test_h3_fal_fallback_opt_in_is_logged(flow, assets, monkeypatch, caplog):
+    p = assets / "a.png"
+    p.write_bytes(PNG)
+    _failing_assets(monkeypatch, "http500")
+    monkeypatch.setenv("HEYGEN_ALLOW_FAL_FALLBACK", "1")
+    sent = []
+    monkeypatch.setattr(_shared, "upload_image_fal", lambda path: sent.append(path) or "https://fal.example/a.png")
+    with caplog.at_level("WARNING"):
+        out = _shared.upload_image_heygen(str(p), "test-not-a-key")
+    assert out == {"type": "url", "url": "https://fal.example/a.png"}
+    assert sent == [str(p.resolve())]
+    assert "fal.ai" in caplog.text and "HTTP 500" in caplog.text and "test-not-a-key" not in caplog.text
+
+
+def test_h3_image_to_video_flow_refuses_outside_path(flow, assets):
+    secret = flow.tmp / "x.png"
+    secret.write_bytes(PNG)
+    with pytest.raises(ValueError, match="outside"):
+        _shared.generate_heygen_video({"prompt": "p", "operation": "image_to_video",
+                                       "reference_image_path": str(secret)})
+    assert flow.log == []

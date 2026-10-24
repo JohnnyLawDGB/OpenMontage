@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ from typing import Any
 from urllib.parse import urljoin, urlsplit
 
 from tools.base_tool import ToolResult, ToolStatus
+
+logger = logging.getLogger(__name__)
 
 
 # HeyGen v3 (POST /v3/models/videos) offers one model, heygen-video-1. The
@@ -491,35 +494,88 @@ def upload_image_fal(image_path: str) -> str:
     return data["file_url"]
 
 
+HEYGEN_MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+_UPLOAD_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
+
+
+def _sniff_image_type(head: bytes) -> str | None:
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def validate_heygen_upload_path(image_path: str) -> tuple[Path, str]:
+    """Return (resolved path, content type) for an image that may be uploaded.
+
+    The path must resolve (symlinks followed) inside <repo>/projects, <repo>/assets
+    or OPENMONTAGE_ASSET_DIR. It must be a png, jpeg or webp of at most 32 MB whose
+    magic bytes match its extension; the content type comes from the magic bytes.
+    """
+    resolved = Path(image_path).resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    repo_root = Path(__file__).resolve().parents[2]
+    roots = [repo_root / "projects", repo_root / "assets"]
+    if os.environ.get("OPENMONTAGE_ASSET_DIR"):
+        roots.append(Path(os.environ["OPENMONTAGE_ASSET_DIR"]).expanduser())
+    if not any(resolved.is_relative_to(root.resolve()) for root in roots):
+        raise ValueError(f"Refusing to upload {resolved.name}: outside the project asset directory")
+    expected = _UPLOAD_IMAGE_TYPES.get(resolved.suffix.lower())
+    if not expected:
+        raise ValueError(f"Refusing to upload {resolved.name}: only png, jpg, jpeg and webp images are allowed")
+    size = resolved.stat().st_size
+    if size == 0 or size > HEYGEN_MAX_UPLOAD_BYTES:
+        raise ValueError(f"Refusing to upload {resolved.name}: size must be 1 to {HEYGEN_MAX_UPLOAD_BYTES} bytes")
+    with resolved.open("rb") as fh:
+        content_type = _sniff_image_type(fh.read(16))
+    if content_type != expected:
+        raise ValueError(f"Refusing to upload {resolved.name}: file content does not match its extension")
+    return resolved, content_type
+
+
 def upload_image_heygen(image_path: str, api_key: str) -> dict[str, str]:
     """Upload a local image with POST /v3/assets (multipart) and return a v3
     asset input ({"type": "asset_id", "asset_id": ...}).
 
-    Replaces POST /v2/assets/upload (retired Oct 31, 2026). Falls back to
-    fal.ai storage and returns a URL asset input if the HeyGen upload fails.
+    Replaces POST /v2/assets/upload (retired Oct 31, 2026). The path is checked
+    by validate_heygen_upload_path first. If the HeyGen upload fails the image is
+    NOT sent to public fal.ai storage unless HEYGEN_ALLOW_FAL_FALLBACK=1; the
+    fallback is logged as a warning.
     """
     import requests
 
-    path = Path(image_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
+    path, content_type = validate_heygen_upload_path(image_path)
 
     try:
         with path.open("rb") as fh:
             resp = requests.post(
                 f"{HEYGEN_API_BASE}/v3/assets",
                 headers={"X-Api-Key": api_key},
-                files={"file": (path.name, fh)},
+                files={"file": (path.name, fh, content_type)},
                 timeout=60,
             )
-        if resp.status_code in (200, 201):
-            asset_id = resp.json().get("data", {}).get("asset_id")
-            if asset_id:
-                return {"type": "asset_id", "asset_id": asset_id}
-    except Exception:
-        pass
+        asset_id = resp.json().get("data", {}).get("asset_id") if resp.status_code in (200, 201) else None
+        failure = "no asset_id in response" if resp.status_code in (200, 201) else f"HTTP {resp.status_code}"
+    except Exception as exc:
+        asset_id, failure = None, type(exc).__name__
+    if asset_id:
+        return {"type": "asset_id", "asset_id": asset_id}
 
-    return {"type": "url", "url": upload_image_fal(image_path)}
+    if os.environ.get("HEYGEN_ALLOW_FAL_FALLBACK") != "1":
+        raise RuntimeError(
+            f"HeyGen asset upload failed ({failure}). The public fal.ai fallback is off; "
+            "set HEYGEN_ALLOW_FAL_FALLBACK=1 to allow it."
+        )
+    logger.warning(
+        "HeyGen asset upload failed (%s); uploading %s to public fal.ai storage (HEYGEN_ALLOW_FAL_FALLBACK=1)",
+        failure,
+        path.name,
+    )
+    return {"type": "url", "url": upload_image_fal(str(path))}
 
 
 def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
