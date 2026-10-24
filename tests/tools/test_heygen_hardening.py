@@ -1369,3 +1369,77 @@ def test_fb_opt_in_still_runs_the_path_validation(selector, monkeypatch, flow):
     monkeypatch.setattr("requests.post", lambda *a, **k: pytest.fail("no request expected"))
     out = sel.execute({"prompt": "p", "operation": "image_to_video", "reference_image_path": str(outside)})
     assert not out.success and "outside" in out.error and provider.seen == []
+
+
+# ------------------------------------------------ Follow-up (c): output_path re-validated before the download
+
+def _on_poll(flow, monkeypatch, action):
+    """Run action() when the poll request is made (the long wait in a real run)."""
+    inner = requests.get
+    fired = []
+
+    def get(url, **kw):
+        if url.startswith("https://api.heygen.com/") and not fired:
+            fired.append(1)
+            action()
+        return inner(url, **kw)
+
+    monkeypatch.setattr("requests.get", get)
+
+
+def _swap_dir_for_symlink(real: Path, target: Path):
+    def action():
+        real.rmdir()
+        real.symlink_to(target, target_is_directory=True)
+    return action
+
+
+def test_fc_symlink_planted_during_polling_is_caught_before_the_download(flow, monkeypatch):
+    sub, outside = flow.out / "sub", flow.tmp / "elsewhere"
+    sub.mkdir()
+    outside.mkdir()
+    _on_poll(flow, monkeypatch, _swap_dir_for_symlink(sub, outside))
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(sub / "o.mp4")})
+    assert not out.success and "outside" in out.error and "vid_1" in out.error
+    assert list(outside.iterdir()) == []
+    assert [c for c in flow.log if c[0] == "GET" and "heygen.ai" in c[1] and "api." not in c[1]] == []   # no download
+
+
+def test_fc_after_the_refusal_a_rerun_resumes_without_a_second_create(flow, monkeypatch):
+    sub, outside = flow.out / "sub", flow.tmp / "elsewhere"
+    sub.mkdir()
+    outside.mkdir()
+    _on_poll(flow, monkeypatch, _swap_dir_for_symlink(sub, outside))
+    assert not _shared.generate_heygen_video({"prompt": "p", "output_path": str(sub / "o.mp4")}).success
+    sub.unlink()
+    again = _shared.generate_heygen_video({"prompt": "p", "output_path": str(sub / "o.mp4")})
+    assert again.success and again.data["resumed"]
+    assert len(_creates(flow)) == 1 and (sub / "o.mp4").read_bytes() == MP4
+
+
+def test_fc_symlink_planted_during_the_download_is_caught_before_the_rename(flow, monkeypatch):
+    sub, outside = flow.out / "sub", flow.tmp / "elsewhere"
+    sub.mkdir()
+    outside.mkdir()
+
+    class SwapMidStream(Resp):
+        def iter_content(self, chunk_size=1):
+            yield MP4
+            sub.rename(flow.tmp / "moved")    # the directory (and the temp file in it) is moved away
+            sub.symlink_to(outside, target_is_directory=True)
+            yield b"more"
+
+    monkeypatch.setattr("requests.get", lambda url, **kw: (
+        Resp({"data": {"status": "completed", "video_url": GOOD_URL}}) if url.startswith("https://api.") else SwapMidStream()))
+    out = _shared.generate_heygen_video({"prompt": "p", "output_path": str(sub / "o.mp4")})
+    assert not out.success and "outside" in out.error
+    assert list(outside.iterdir()) == []
+
+
+def test_fc_download_confine_flag_defaults_off_for_direct_callers(monkeypatch, tmp_path):
+    _get_returning(monkeypatch, Resp())
+    assert _shared.download_heygen_video(GOOD_URL, tmp_path / "o.mp4") == len(MP4)      # outside roots, not confined
+    _get_returning(monkeypatch, Resp())
+    with pytest.raises(_shared.OutputPathError):
+        _shared.download_heygen_video(GOOD_URL, tmp_path / "o2.mp4", confine=True)
+    assert not (tmp_path / "o2.mp4").exists()

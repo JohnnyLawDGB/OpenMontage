@@ -660,8 +660,18 @@ def _refusal(url: str) -> ValueError:
     return ValueError("Refusing HeyGen video download (url not allowed)")
 
 
-def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HEYGEN_MAX_DOWNLOAD_BYTES) -> int:
+def download_heygen_video(
+    video_url: str,
+    output_path: Path,
+    max_bytes: int = HEYGEN_MAX_DOWNLOAD_BYTES,
+    confine: bool = False,
+) -> int:
     """Download a completed HeyGen video to output_path and return its size.
+
+    With confine=True the destination is validated again (validate_heygen_output_path)
+    before the first request and again right before the final rename, because polling
+    and the download can take many minutes and a directory on the path may have been
+    replaced by a symlink in the meantime.
 
     https only, host allowlist and parser agreement (re-checked on every redirect), streamed to a
     .part file with a size cap. No API key is sent. The URL is never put in an
@@ -669,6 +679,8 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
     """
     import requests
 
+    if confine:
+        output_path = validate_heygen_output_path(output_path)
     url = video_url
     for _ in range(HEYGEN_MAX_REDIRECTS + 1):
         if not _heygen_download_url_ok(url):  # initial URL and every redirect hop
@@ -728,6 +740,8 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
                     raise RuntimeError("HeyGen video download was empty")
                 if head[4:8] != b"ftyp":  # every mp4 starts with a size field then 'ftyp'
                     raise ValueError("HeyGen video download is not an mp4 file")
+                if confine:
+                    output_path = validate_heygen_output_path(output_path)
                 os.chmod(tmp, 0o644)  # mkstemp creates 0600; keep the usual mode for a media file
                 os.replace(tmp, output_path)
             except BaseException:
@@ -819,6 +833,10 @@ def _heygen_default_output_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "projects" / "_heygen"
 
 
+class OutputPathError(ValueError):
+    """output_path is not allowed (outside the asset roots, wrong suffix, a directory, exists)."""
+
+
 def validate_heygen_output_path(output_path: str | Path) -> Path:
     """Return the resolved path a HeyGen video may be written to, or raise ValueError.
 
@@ -827,11 +845,11 @@ def validate_heygen_output_path(output_path: str | Path) -> Path:
     """
     resolved = Path(output_path).resolve()
     if not any(resolved.is_relative_to(root) for root in _allowed_asset_roots()):
-        raise ValueError(f"Refusing to write {resolved.name}: output_path is outside the project asset directory")
+        raise OutputPathError(f"Refusing to write {resolved.name}: output_path is outside the project asset directory")
     if resolved.suffix.lower() != ".mp4":
-        raise ValueError(f"Refusing to write {resolved.name}: output_path must end in .mp4")
+        raise OutputPathError(f"Refusing to write {resolved.name}: output_path must end in .mp4")
     if resolved.is_dir():
-        raise ValueError(f"Refusing to write {resolved.name}: output_path is a directory")
+        raise OutputPathError(f"Refusing to write {resolved.name}: output_path is a directory")
     return resolved
 
 
@@ -964,7 +982,7 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     custom_output = inputs.get("output_path")
     try:
         output_path = validate_heygen_output_path(custom_output) if custom_output else None
-    except ValueError as exc:
+    except OutputPathError as exc:
         return ToolResult(success=False, error=str(exc))
 
     # Resume: a job saved for the same request is polled instead of creating (and
@@ -1047,7 +1065,14 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
         raise
     if output_path is None:
         output_path = validate_heygen_output_path(_heygen_default_output_dir() / f"heygen_video_{execution_id}.mp4")
-    download_heygen_video(video_url, output_path)
+    # Polling can take up to 10 minutes: check the destination again right before downloading
+    # (and download_heygen_video checks once more just before the rename). The video id stays
+    # saved, so after fixing the path a re-run downloads it without creating a new video.
+    try:
+        output_path = validate_heygen_output_path(output_path)
+        download_heygen_video(video_url, output_path, confine=True)
+    except OutputPathError as exc:
+        return ToolResult(success=False, error=f"{exc}. The HeyGen video {execution_id} is kept; re-run to download it")
 
     meta = HEYGEN_PROVIDERS[provider]
     return ToolResult(
