@@ -516,6 +516,18 @@ def _heygen_download_url_ok(url: str) -> bool:
     return _https_url_syntax_ok(url) and _heygen_download_host_allowed(urlsplit(url).hostname)
 
 
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_URL_ARG_RE = re.compile(r"(\burl:\s*)[^\s'\")]+", re.IGNORECASE)
+
+
+def scrub_urls(text: str) -> str:
+    """Remove URLs (and urllib3's 'with url: /path?query' form) from error text.
+
+    HeyGen video links are signed, so they must not reach ToolResult.error or logs.
+    """
+    return _URL_ARG_RE.sub(r"\1<removed>", _URL_RE.sub("<url removed>", text))
+
+
 def _refusal(url: str) -> ValueError:
     # Name the host only when the URL is well formed and just not allowlisted, so an
     # operator can add it to HEYGEN_EXTRA_DOWNLOAD_HOSTS. Never the path or query (signed).
@@ -537,7 +549,16 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
     for _ in range(HEYGEN_MAX_REDIRECTS + 1):
         if not _heygen_download_url_ok(url):  # initial URL and every redirect hop
             raise _refusal(url)
-        resp = requests.get(url, stream=True, timeout=120, allow_redirects=False)
+        # requests and urllib3 put the full URL, query string included, in their messages, so
+        # only the exception class name is kept, and it is raised outside the except block so
+        # the original exception is not attached as __context__.
+        failure = None
+        try:
+            resp = requests.get(url, stream=True, timeout=120, allow_redirects=False)
+        except requests.RequestException as exc:
+            failure = type(exc).__name__
+        if failure:
+            raise RuntimeError(f"HeyGen video download failed: {failure}")
         try:
             if resp.status_code in _REDIRECT_CODES:
                 location = resp.headers.get("Location")
@@ -547,7 +568,8 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
                     raise _refusal("")  # urljoin would silently drop tabs and newlines
                 url = urljoin(url, location)
                 continue
-            resp.raise_for_status()
+            if resp.status_code >= 400:  # not raise_for_status(): its message carries the signed URL
+                raise RuntimeError(f"HeyGen video download failed: HTTP {resp.status_code}")
             ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
             if ctype and not (ctype.startswith("video/") or ctype == "application/octet-stream"):
                 raise ValueError(f"Unexpected content type for HeyGen video download: {ctype}")
@@ -559,11 +581,16 @@ def download_heygen_video(video_url: str, output_path: Path, max_bytes: int = HE
             written = 0
             try:
                 with tmp.open("wb") as fh:
-                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        written += len(chunk)
-                        if written > max_bytes:
-                            raise ValueError(f"HeyGen video exceeded the {max_bytes} byte limit")
-                        fh.write(chunk)
+                    try:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise ValueError(f"HeyGen video exceeded the {max_bytes} byte limit")
+                            fh.write(chunk)
+                    except requests.RequestException as exc:
+                        failure = type(exc).__name__
+                    if failure:
+                        raise RuntimeError(f"HeyGen video download failed: {failure}")
                 if written == 0:
                     raise RuntimeError("HeyGen video download was empty")
                 tmp.replace(output_path)

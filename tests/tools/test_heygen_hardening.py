@@ -73,6 +73,9 @@ def flow(monkeypatch, tmp_path):
     monkeypatch.setattr("requests.get", get)
     monkeypatch.setattr("requests.put", lambda *a, **k: pytest.fail("unexpected PUT"))
     f.tmp = tmp_path
+    f.out = tmp_path / "out"
+    f.out.mkdir()
+    monkeypatch.setenv("OPENMONTAGE_ASSET_DIR", str(f.out))
     return f
 
 
@@ -600,3 +603,85 @@ def test_f1_extra_hosts_env_ignores_nonsense_entries_but_never_ips_via_syntax(mo
     monkeypatch.setenv("HEYGEN_EXTRA_DOWNLOAD_HOSTS", extra)
     assert not _shared._heygen_download_url_ok("https://evil.tld\\@heygen.ai/v.mp4")
     assert not _shared._heygen_download_url_ok("https://evil.tld/v.mp4")
+
+
+# ------------------------------------------------ Security flag F2: signed URL in error text
+
+SIG_URL = "https://resource2.heygen.ai/v.mp4?X-Amz-Signature=FAKESIG123&Expires=1"
+
+
+def _assert_clean(text):
+    assert "FAKESIG123" not in text and "Signature" not in text and "Expires" not in text
+
+
+@pytest.mark.parametrize("status", [403, 404, 500])
+def test_f2_http_error_on_download_has_no_url(monkeypatch, tmp_path, status):
+    _get_returning(monkeypatch, Resp(status=status))
+    with pytest.raises(RuntimeError) as e:
+        _shared.download_heygen_video(SIG_URL, tmp_path / "o.mp4")
+    _assert_clean(str(e.value) + repr(e.value) + repr(e.value.__cause__) + repr(e.value.__context__))
+    assert f"HTTP {status}" in str(e.value) and e.value.__cause__ is None and e.value.__context__ is None
+
+
+@pytest.mark.parametrize("exc", [
+    requests.ConnectionError(f"Max retries exceeded with url: /v.mp4?X-Amz-Signature=FAKESIG123&Expires=1 ({SIG_URL})"),
+    requests.Timeout(f"Read timed out for url: {SIG_URL}"),
+    requests.exceptions.SSLError(SIG_URL),
+])
+def test_f2_connection_error_on_download_has_no_url(monkeypatch, tmp_path, exc):
+    def get(url, **kw):
+        raise exc
+
+    monkeypatch.setattr("requests.get", get)
+    with pytest.raises(RuntimeError) as e:
+        _shared.download_heygen_video(SIG_URL, tmp_path / "o.mp4")
+    _assert_clean(str(e.value) + repr(e.value.__cause__) + repr(e.value.__context__))
+    assert type(exc).__name__ in str(e.value)
+
+
+def test_f2_error_while_streaming_has_no_url(monkeypatch, tmp_path):
+    class Broken(Resp):
+        def iter_content(self, chunk_size=1):
+            yield b"\x00\x00\x00\x18ftypmp42"
+            raise requests.exceptions.ChunkedEncodingError(f"broken for url: {SIG_URL}")
+
+    _get_returning(monkeypatch, Broken())
+    with pytest.raises(RuntimeError) as e:
+        _shared.download_heygen_video(SIG_URL, tmp_path / "o.mp4")
+    _assert_clean(str(e.value) + repr(e.value.__cause__) + repr(e.value.__context__))
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_f2_tool_result_error_has_no_signed_url(flow, monkeypatch, caplog, status):
+    flow.video_url = SIG_URL
+    real_get = requests.get
+
+    def get(url, **kw):
+        if url.startswith("https://resource2.heygen.ai/"):
+            return Resp(status=status)
+        return real_get(url, **kw)
+
+    monkeypatch.setattr("requests.get", get)
+    with caplog.at_level("DEBUG"):
+        out = HeyGenVideo().execute({"prompt": "p", "output_path": str(flow.out / "o.mp4")})
+    assert not out.success
+    _assert_clean(out.error + caplog.text)
+
+
+def test_f2_tool_result_scrubs_urls_from_any_exception(flow, monkeypatch):
+    monkeypatch.setattr(_shared, "generate_heygen_video", lambda inputs: (_ for _ in ()).throw(
+        requests.HTTPError(f"403 Client Error: Forbidden for url: {SIG_URL}")))
+    monkeypatch.setattr("tools.video.heygen_video.generate_heygen_video", _shared.generate_heygen_video)
+    out = HeyGenVideo().execute({"prompt": "p"})
+    _assert_clean(out.error)
+    assert "403" in out.error
+
+
+@pytest.mark.parametrize("text", [
+    f"Max retries exceeded with url: /v.mp4?X-Amz-Signature=FAKESIG123&Expires=1 (Caused by X)",
+    f"403 Client Error: Forbidden for url: {SIG_URL}",
+    f"plain {SIG_URL} text",
+])
+def test_f2_scrub_urls(text):
+    _assert_clean(_shared.scrub_urls(text))

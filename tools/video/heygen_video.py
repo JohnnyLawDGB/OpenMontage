@@ -27,6 +27,7 @@ from tools.video._shared import (
     estimate_speed_runtime,
     generate_heygen_video,
     heygen_idempotency_key,
+    scrub_urls,
 )
 
 
@@ -126,7 +127,7 @@ class HeyGenVideo(BaseTool):
         try:
             result = generate_heygen_video(inputs)
         except Exception as exc:
-            return ToolResult(success=False, error=f"HeyGen video generation failed: {exc}")
+            return ToolResult(success=False, error=f"HeyGen video generation failed: {scrub_urls(str(exc))}")
         result.duration_seconds = round(time.time() - start, 2)
         result.cost_usd = 0.0 if (result.data or {}).get("resumed") else self.estimate_cost(inputs)
         return result
