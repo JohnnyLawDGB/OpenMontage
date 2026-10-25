@@ -11,6 +11,7 @@ from tools.base_tool import (
     Determinism,
     ExecutionMode,
     ResourceProfile,
+    ResumeSupport,
     RetryPolicy,
     ToolResult,
     ToolRuntime,
@@ -18,12 +19,21 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
-from tools.video._shared import HEYGEN_PROVIDERS, estimate_quality_cost, estimate_speed_runtime, generate_heygen_video
+from tools.video._shared import (
+    HEYGEN_DEFAULT_PROVIDER,
+    HEYGEN_IDEMPOTENCY_FIELDS,
+    HEYGEN_PROVIDERS,
+    estimate_heygen_cost,
+    estimate_speed_runtime,
+    generate_heygen_video,
+    heygen_idempotency_key,
+    scrub_urls,
+)
 
 
 class HeyGenVideo(BaseTool):
     name = "heygen_video"
-    version = "0.1.0"
+    version = "0.2.0"  # HeyGen API v3 (v1/v2 retired Oct 31, 2026)
     tier = ToolTier.GENERATE
     capability = "video_generation"
     provider = "heygen"
@@ -35,7 +45,7 @@ class HeyGenVideo(BaseTool):
     install_instructions = (
         "Set the HEYGEN_API_KEY environment variable:\n"
         "  set HEYGEN_API_KEY=your_key_here\n"
-        "Get a key at https://app.heygen.com/settings/api"
+        "Get a key at https://platform.heygen.com/api-keys"
     )
     fallback = "wan_video"
     fallback_tools = ["wan_video", "hunyuan_video", "ltx_video_local", "cogvideo_video", "ltx_video_modal", "image_selector"]
@@ -50,7 +60,7 @@ class HeyGenVideo(BaseTool):
     }
     best_for = [
         "premium cloud video generation without local GPU setup",
-        "fast access to VEO, Sora, Kling, Runway, and Seedance providers",
+        "prompt-to-video clips (5-15 s, with audio) on HeyGen Video 1 via the v3 API",
     ]
     not_good_for = [
         "offline or privacy-constrained rendering",
@@ -73,7 +83,7 @@ class HeyGenVideo(BaseTool):
             "provider_variant": {
                 "type": "string",
                 "enum": sorted(HEYGEN_PROVIDERS),
-                "default": "veo_3_1",
+                "default": HEYGEN_DEFAULT_PROVIDER,
             },
             "reference_image_url": {"type": "string"},
             "reference_image_path": {"type": "string"},
@@ -82,25 +92,43 @@ class HeyGenVideo(BaseTool):
                 "enum": ["16:9", "9:16", "1:1"],
                 "default": "16:9",
             },
-            "output_path": {"type": "string"},
+            "duration": {"type": "integer", "minimum": 5, "maximum": 15, "default": 5},
+            "resolution": {"type": "string", "enum": ["480p", "768p", "1080p", "2k"], "default": "768p"},
+            "output_path": {
+                "type": "string",
+                "description": (
+                    "Where to write the mp4. Must be inside projects/, assets/ or OPENMONTAGE_ASSET_DIR "
+                    "and end in .mp4. An existing file is never overwritten unless overwrite is true."
+                ),
+            },
+            "overwrite": {
+                "type": "boolean",
+                "default": False,
+                "description": "Replace an existing file at output_path (default: refuse).",
+            },
         },
     }
 
     resource_profile = ResourceProfile(cpu_cores=1, ram_mb=512, vram_mb=0, disk_mb=500, network_required=True)
     retry_policy = RetryPolicy(max_retries=2, backoff_seconds=10.0, retryable_errors=["rate_limit", "timeout", "server_error"])
-    idempotency_key_fields = ["prompt", "provider_variant", "aspect_ratio"]
+    resume_support = ResumeSupport.FROM_CHECKPOINT  # saved video_id is polled again instead of re-creating
+    idempotency_key_fields = list(HEYGEN_IDEMPOTENCY_FIELDS)
     side_effects = ["writes video file to output_path", "calls HeyGen API"]
     user_visible_verification = ["Watch generated clip for motion quality and prompt adherence"]
 
     def get_status(self) -> ToolStatus:
         return ToolStatus.AVAILABLE if os.environ.get("HEYGEN_API_KEY") else ToolStatus.UNAVAILABLE
 
+    def idempotency_key(self, inputs: dict[str, Any]) -> str:
+        # Adds a digest of the reference image file; generate_heygen_video uses the same key to resume.
+        return heygen_idempotency_key(inputs)
+
     def estimate_cost(self, inputs: dict[str, Any]) -> float:
-        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", "veo_3_1"), HEYGEN_PROVIDERS["veo_3_1"])
-        return estimate_quality_cost(meta["quality"])
+        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])
+        return estimate_heygen_cost(meta["quality"], inputs.get("resolution"))
 
     def estimate_runtime(self, inputs: dict[str, Any]) -> float:
-        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", "veo_3_1"), HEYGEN_PROVIDERS["veo_3_1"])
+        meta = HEYGEN_PROVIDERS.get(inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER), HEYGEN_PROVIDERS[HEYGEN_DEFAULT_PROVIDER])
         return estimate_speed_runtime(meta["speed"])
 
     def execute(self, inputs: dict[str, Any]) -> ToolResult:
@@ -110,8 +138,8 @@ class HeyGenVideo(BaseTool):
         try:
             result = generate_heygen_video(inputs)
         except Exception as exc:
-            return ToolResult(success=False, error=f"HeyGen video generation failed: {exc}")
+            return ToolResult(success=False, error=f"HeyGen video generation failed: {scrub_urls(str(exc))}")
         result.duration_seconds = round(time.time() - start, 2)
-        result.cost_usd = self.estimate_cost(inputs)
+        result.cost_usd = 0.0 if (result.data or {}).get("resumed") else self.estimate_cost(inputs)
         return result
 

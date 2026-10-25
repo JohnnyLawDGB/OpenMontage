@@ -2,17 +2,36 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import json
+import logging
+import math
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from tools.base_tool import ToolResult, ToolStatus
 
+logger = logging.getLogger(__name__)
 
+
+# HeyGen v3 (POST /v3/models/videos) offers one model, heygen-video-1. The
+# third-party variants below ran on the v1 workflows API (GenerateVideoNode),
+# retired by HeyGen on Oct 31, 2026, with no documented v3 equivalent. They are
+# kept only so old configs get a clear error instead of an unknown-key error.
+HEYGEN_DEFAULT_PROVIDER = "heygen_video_1"
 HEYGEN_PROVIDERS = {
+    "heygen_video_1": {"name": "HeyGen Video 1 (v3)", "quality": "high", "speed": "medium"},
+}
+HEYGEN_LEGACY_PROVIDERS = {
     "veo_3_1": {"name": "Google VEO 3.1", "quality": "highest", "speed": "slow"},
     "veo_3_1_fast": {"name": "Google VEO 3.1 Fast", "quality": "high", "speed": "medium"},
     "veo3": {"name": "Google VEO 3", "quality": "high", "speed": "slow"},
@@ -165,6 +184,11 @@ def local_install_instructions() -> str:
         "  pip install diffusers transformers accelerate torch pillow requests\n"
         "Use a GPU with the VRAM profile listed on the selected tool."
     )
+
+
+def estimate_heygen_cost(quality: str, resolution: str | None = None) -> float:
+    """Quality-tier estimate, 3x for 1080p and 2k (HeyGen bills those at 3x the 768p rate)."""
+    return estimate_quality_cost(quality) * (3 if resolution in ("1080p", "2k") else 1)
 
 
 def estimate_quality_cost(quality: str) -> float:
@@ -323,11 +347,171 @@ def generate_local_video(
     )
 
 
-def poll_heygen(execution_id: str, api_key: str, timeout: int = 600) -> str:
+HEYGEN_API_BASE = "https://api.heygen.com"
+HEYGEN_V3_MODEL = "heygen-video-1"
+HEYGEN_TERMINAL_FAILED = {"failed", "cancelled"}
+
+
+class HeyGenJobFailed(RuntimeError):
+    """The HeyGen job ended as failed or cancelled (it will not complete)."""
+
+
+# Create-request fields that decide which video a run produces. The local resume
+# key (heygen_idempotency_key) is built from these plus a digest of the reference image.
+HEYGEN_IDEMPOTENCY_FIELDS = [
+    "operation",
+    "prompt",
+    "provider_variant",
+    "aspect_ratio",
+    "duration",
+    "resolution",
+    "reference_image_url",
+    "reference_image_path",
+]
+HEYGEN_DEFAULT_DURATION = 5  # HeyGen defaults, used only so an omitted field and its default share one key
+HEYGEN_DEFAULT_RESOLUTION = "768p"
+HEYGEN_JOB_TTL_SECONDS = 24 * 3600  # HeyGen replays an Idempotency-Key for 24 h
+
+
+def heygen_idempotency_key(inputs: dict[str, Any]) -> str:
+    """Stable key for one logical generation request.
+
+    Defaults are filled in so an omitted field and its default match. For a local
+    reference image the file content digest is included, so a changed file at the
+    same path is a different request.
+    """
+    key_data: dict[str, Any] = {k: inputs.get(k) for k in HEYGEN_IDEMPOTENCY_FIELDS}
+    key_data["operation"] = inputs.get("operation", "text_to_video")
+    key_data["provider_variant"] = inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER)
+    key_data["aspect_ratio"] = inputs.get("aspect_ratio", "16:9")
+    key_data["duration"] = inputs.get("duration", HEYGEN_DEFAULT_DURATION)
+    key_data["resolution"] = inputs.get("resolution", HEYGEN_DEFAULT_RESOLUTION)
+    ref_path = inputs.get("reference_image_path")
+    if ref_path:
+        try:
+            p = Path(ref_path).resolve()  # relative and absolute spellings of one file match
+            key_data["reference_image_path"] = str(p)
+            # Hash only files inside the allowed roots: the upload would refuse any other path.
+            if any(p.is_relative_to(r) for r in _allowed_asset_roots()) and p.is_file() and p.stat().st_size <= HEYGEN_MAX_UPLOAD_BYTES:
+                key_data["reference_image_sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+        except (OSError, RuntimeError):
+            pass
+    raw = json.dumps(key_data, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _ensure_state_dir(path: Path) -> None:
+    """Create the job-state directory (0700). An existing one that is group/world
+    accessible is tightened to 0700; one owned by another user is refused, because that
+    user could replace job files (and so pick which video a re-run downloads)."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name == "nt":
+        return
+    st = path.stat()
+    if st.st_uid != os.getuid():
+        raise PermissionError("HeyGen job-state directory is owned by another user; set OPENMONTAGE_HEYGEN_STATE_DIR")
+    if st.st_mode & 0o077:
+        path.chmod(0o700)
+        logger.warning("Tightened permissions of the HeyGen job-state directory %s to 0700", path)
+
+
+def _heygen_job_path(key: str) -> Path:
+    base = os.environ.get("OPENMONTAGE_HEYGEN_STATE_DIR")
+    root = Path(base).expanduser() if base else Path.home() / ".openmontage" / "heygen_jobs"
+    return root / f"{key}.json"
+
+
+def _load_heygen_job(key: str) -> dict[str, Any] | None:
+    """Saved job for this key, or None if missing, expired or malformed."""
+    try:
+        job = json.loads(_heygen_job_path(key).read_text())
+        created = float(job["created_at"])
+        if not math.isfinite(created) or time.time() - created > HEYGEN_JOB_TTL_SECONDS:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job["idempotency_key"]):
+            return None
+        if "video_id" in job:
+            validate_heygen_video_id(job["video_id"])
+        return job
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_heygen_job(key: str, job: dict[str, Any]) -> None:
+    """Write the job file atomically: unique temp file (mode 0600) in the same
+    directory, then rename. The directory is created with mode 0700."""
+    path = _heygen_job_path(key)
+    _ensure_state_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(job))
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+@contextlib.contextmanager
+def _heygen_job_lock(key: str, timeout: float = 180.0):
+    """Exclusive advisory lock for one request key (a <key>.lock file next to the job
+    file), so two runs with the same key cannot both create a video. Held from the
+    job load until the video_id is saved, not while polling. Released by the OS if the
+    process dies.
+
+    NOTE: the POSIX branch (fcntl.flock) is covered by thread and process tests. The
+    Windows branch (msvcrt.locking on one byte) has NOT been tested; treat it as
+    unverified until someone runs the concurrency tests on Windows."""
+    path = _heygen_job_path(key).with_suffix(".lock")
+    _ensure_state_dir(path.parent)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("Timed out waiting for another HeyGen run with the same request") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor drops the lock
+
+
+def _clear_heygen_job(key: str) -> None:
+    _heygen_job_path(key).unlink(missing_ok=True)
+
+
+def validate_heygen_video_id(video_id: Any) -> str:
+    """Return video_id if it is a plain token, else raise ValueError.
+
+    The id comes from HeyGen's response and is used in the poll URL path and in
+    the default output file name, so it must not carry slashes, dots or spaces.
+    """
+    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+        raise ValueError("Invalid video_id in HeyGen response (expected [A-Za-z0-9_-]{1,64})")
+    return video_id
+
+
+def poll_heygen(video_id: str, api_key: str, timeout: int = 600) -> str:
+    """Poll GET /v3/models/videos/{video_id} until completed; return video_url.
+
+    v1 /v1/workflows/executions is retired by HeyGen on Oct 31, 2026.
+    """
     import requests
 
+    validate_heygen_video_id(video_id)
     headers = {"X-Api-Key": api_key}
-    url = f"https://api.heygen.com/v1/workflows/executions/{execution_id}"
+    url = f"{HEYGEN_API_BASE}/v3/models/videos/{video_id}"
     deadline = time.time() + timeout
     interval = 5.0
 
@@ -338,39 +522,274 @@ def poll_heygen(execution_id: str, api_key: str, timeout: int = 600) -> str:
         status = data.get("status", "")
 
         if status == "completed":
-            video_url = (
-                data.get("output", {}).get("video", {}).get("video_url")
-                or data.get("output", {}).get("video_url")
-            )
+            video_url = data.get("video_url")
             if video_url:
                 return video_url
-            raise RuntimeError(f"Completed but no video_url in output: {data}")
+            raise RuntimeError(f"Completed but no video_url for {video_id}")
 
-        if status in {"failed", "error"}:
-            raise RuntimeError(f"HeyGen generation failed: {data.get('error', 'Unknown')}")
+        if status in HEYGEN_TERMINAL_FAILED:
+            reason = data.get("failure_message") or data.get("failure_code") or "Unknown"
+            raise HeyGenJobFailed(f"HeyGen generation {status}: {reason}")
 
         time.sleep(min(interval, max(0.0, deadline - time.time())))
         interval = min(interval * 1.2, 30.0)
 
-    raise TimeoutError(f"HeyGen execution {execution_id} timed out after {timeout}s")
+    raise TimeoutError(f"HeyGen video {video_id} timed out after {timeout}s")
+
+
+# Hosts the completed video_url may be fetched from: HeyGen's own CDN
+# (docs show resource2.heygen.ai). Extra exact hosts can be added with
+# HEYGEN_EXTRA_DOWNLOAD_HOSTS (comma separated) if a real response uses another one.
+HEYGEN_DOWNLOAD_HOST_SUFFIXES = ("heygen.ai", "heygen.com")
+HEYGEN_MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024
+HEYGEN_MAX_REDIRECTS = 3
+HEYGEN_DOWNLOAD_DEADLINE_SECONDS = 15 * 60  # whole body, so a slow-drip server cannot hold the job open
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+
+_HOSTNAME_RE = re.compile(r"[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})*")
+
+
+def _heygen_download_host_allowed(host: str | None) -> bool:
+    host = (host or "").lower()
+    if not _HOSTNAME_RE.fullmatch(host):  # no empty labels, no trailing dot, no odd characters
+        return False
+    extra = {h.strip().lower() for h in os.environ.get("HEYGEN_EXTRA_DOWNLOAD_HOSTS", "").split(",") if h.strip()}
+    return host in extra or any(host == s or host.endswith("." + s) for s in HEYGEN_DOWNLOAD_HOST_SUFFIXES)
+
+
+def _https_url_syntax_ok(url: str) -> bool:
+    """True if url is a plain https URL that urllib.parse and urllib3 (what requests
+    connects with) read the same way.
+
+    Rejects non-ASCII, whitespace, control characters and backslashes anywhere in the
+    string, userinfo, ports other than 443, and any difference between the two parsers
+    about the host (for example https://evil.tld\\@heygen.ai/).
+    """
+    from urllib3.util import parse_url
+
+    if not isinstance(url, str) or not url.isascii():
+        return False
+    if any(ord(c) <= 0x20 or ord(c) == 0x7F or c == "\\" for c in url):
+        return False
+    try:
+        p = urlsplit(url)
+        if p.scheme != "https" or p.username is not None or p.password is not None:
+            return False
+        if p.port not in (None, 443):
+            return False
+        q = parse_url(url)
+    except ValueError:
+        return False
+    host = (p.hostname or "").lower()
+    return bool(host) and (q.host or "").lower() == host and q.scheme == "https" and q.auth is None
+
+
+_LOCAL_SUFFIXES = (
+    ".localhost", ".local", ".localdomain", ".internal", ".intranet", ".lan", ".home", ".corp",
+    ".private", ".test", ".example", ".invalid", ".arpa", ".onion",
+)
+_SECRET_PARAM_RE = re.compile(
+    r".*(token|secret|passw|pwd|api[-_]?key|access[-_]?key|credential|signature|bearer|jwt).*"
+    r"|(x-amz-|x-goog-|x-ms-).*"
+    r"|(key|sig|auth|authorization|authkey|session|sessionid|sid)",
+    re.IGNORECASE,
+)
+_SECRET_VALUE_RE = re.compile(r"^(sk-|sk_|ghp_|gho_|github_pat_|xox[abp]-|AKIA|ASIA|eyJ|Bearer)", re.IGNORECASE)
+_REFERENCE_URL_MAX_QUERY = 512
+
+
+def _reference_url_ok(url: Any) -> bool:
+    """True if url is a plain https URL to a public-looking DNS name that HeyGen may fetch.
+
+    Rejects: anything _https_url_syntax_ok rejects; IP literals (including decimal, hex
+    and short forms such as 2130706433 or 127.1); localhost and other single-label or
+    local-only names (.local, .internal, .lan, ...); a top-level label that is not
+    alphabetic; fragments; long queries; and query parameters that look like secrets
+    (token, key, signature, auth, ... or values such as sk-, ghp_, eyJ). Plain queries
+    such as ?w=800 or ?v=3 are allowed. This cannot tell whether a public name resolves
+    to a private address; HeyGen, not this process, fetches the URL.
+    """
+    import ipaddress
+    from urllib.parse import parse_qsl
+
+    if not isinstance(url, str) or not _https_url_syntax_ok(url):
+        return False
+    p = urlsplit(url)
+    host = (p.hostname or "").lower().rstrip(".")
+    if p.fragment or len(p.query) > _REFERENCE_URL_MAX_QUERY or "." not in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    labels = host.split(".")
+    tld = labels[-1]
+    if not (re.fullmatch(r"[a-z]{2,63}", tld) or re.fullmatch(r"xn--[a-z0-9-]{1,59}", tld)):
+        return False  # numeric last label: 127.1, 0x7f.1, 1.2.3.4.5
+    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES) or any(not lbl or lbl.startswith("-") or lbl.endswith("-") for lbl in labels):
+        return False
+    for name, value in parse_qsl(p.query, keep_blank_values=True):
+        if _SECRET_PARAM_RE.fullmatch(name) or _SECRET_VALUE_RE.match(value):
+            return False
+    return True
+
+
+def _heygen_download_url_ok(url: str) -> bool:
+    return _https_url_syntax_ok(url) and _heygen_download_host_allowed(urlsplit(url).hostname)
+
+
+_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+_URL_ARG_RE = re.compile(r"(\burl:\s*)[^\s'\")]+", re.IGNORECASE)
+
+
+def scrub_urls(text: str) -> str:
+    """Remove URLs (and urllib3's 'with url: /path?query' form) from error text.
+
+    HeyGen video links are signed, so they must not reach ToolResult.error or logs.
+    """
+    return _URL_ARG_RE.sub(r"\1<removed>", _URL_RE.sub("<url removed>", text))
+
+
+def _refusal(url: str) -> ValueError:
+    # Name the host only when the URL is well formed and just not allowlisted, so an
+    # operator can add it to HEYGEN_EXTRA_DOWNLOAD_HOSTS. Never the path or query (signed).
+    if _https_url_syntax_ok(url):
+        return ValueError(f"Refusing HeyGen video download from host {urlsplit(url).hostname}")
+    return ValueError("Refusing HeyGen video download (url not allowed)")
+
+
+def _link_no_overwrite(tmp: Path, dest: Path) -> None:
+    """Give tmp the name dest unless dest exists (atomic where hard links work)."""
+    try:
+        os.link(tmp, dest)
+    except FileExistsError:
+        raise OutputPathError(
+            f"Refusing to overwrite existing {dest.name}: output_path already exists "
+            "(pass overwrite=true to replace it, or choose another path)"
+        ) from None
+    except OSError:  # no hard links on this filesystem: best effort
+        if dest.exists():
+            raise OutputPathError(f"Refusing to overwrite existing {dest.name}: output_path already exists") from None
+        os.replace(tmp, dest)
+
+
+def download_heygen_video(
+    video_url: str,
+    output_path: Path,
+    max_bytes: int = HEYGEN_MAX_DOWNLOAD_BYTES,
+    confine: bool = False,
+    overwrite: bool = True,
+) -> int:
+    """Download a completed HeyGen video to output_path and return its size.
+
+    With confine=True the destination is validated again (validate_heygen_output_path)
+    before the first request and again right before the final rename, because polling
+    and the download can take many minutes and a directory on the path may have been
+    replaced by a symlink in the meantime. With overwrite=False an existing file is
+    never replaced: the final step is an atomic hard link that fails if the name exists
+    (a plain exists() check followed by a rename when the filesystem has no hard links).
+
+    https only, host allowlist and parser agreement (re-checked on every redirect), streamed to a
+    .part file with a size cap. No API key is sent. The URL is never put in an
+    error message because it is a signed URL.
+    """
+    import requests
+
+    if confine:
+        output_path = validate_heygen_output_path(output_path, overwrite=overwrite)
+    url = video_url
+    for _ in range(HEYGEN_MAX_REDIRECTS + 1):
+        if not _heygen_download_url_ok(url):  # initial URL and every redirect hop
+            raise _refusal(url)
+        # requests and urllib3 put the full URL, query string included, in their messages, so
+        # only the exception class name is kept, and it is raised outside the except block so
+        # the original exception is not attached as __context__.
+        failure = None
+        try:
+            resp = requests.get(url, stream=True, timeout=120, allow_redirects=False)
+        except requests.RequestException as exc:
+            failure = type(exc).__name__
+        if failure:
+            raise RuntimeError(f"HeyGen video download failed: {failure}")
+        try:
+            if resp.status_code in _REDIRECT_CODES:
+                location = resp.headers.get("Location")
+                if not location:
+                    raise RuntimeError("HeyGen video download redirect without Location")
+                if any(ord(c) <= 0x20 or ord(c) == 0x7F or c == "\\" for c in location):
+                    raise _refusal("")  # urljoin would silently drop tabs and newlines
+                url = urljoin(url, location)
+                continue
+            if resp.status_code >= 400:  # not raise_for_status(): its message carries the signed URL
+                raise RuntimeError(f"HeyGen video download failed: HTTP {resp.status_code}")
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ctype and not (ctype.startswith("video/") or ctype == "application/octet-stream"):
+                raise ValueError(f"Unexpected content type for HeyGen video download: {ctype}")
+            declared = resp.headers.get("Content-Length", "")
+            if declared.isascii() and declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError(f"HeyGen video is larger than the {max_bytes} byte limit")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Unique temp file in the same directory (never a shared <name>.part), then an
+            # atomic rename, so concurrent downloads to one path cannot corrupt each other.
+            fd, tmp_name = tempfile.mkstemp(dir=output_path.parent, prefix=output_path.name + ".", suffix=".part")
+            tmp = Path(tmp_name)
+            written = 0
+            head = b""
+            deadline = time.monotonic() + HEYGEN_DOWNLOAD_DEADLINE_SECONDS
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    try:
+                        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                            written += len(chunk)
+                            if written > max_bytes:
+                                raise ValueError(f"HeyGen video exceeded the {max_bytes} byte limit")
+                            if time.monotonic() > deadline:
+                                raise RuntimeError("HeyGen video download took too long")
+                            if len(head) < 12:
+                                head = (head + chunk)[:12]
+                            fh.write(chunk)
+                    except requests.RequestException as exc:
+                        failure = type(exc).__name__
+                    if failure:
+                        raise RuntimeError(f"HeyGen video download failed: {failure}")
+                if written == 0:
+                    raise RuntimeError("HeyGen video download was empty")
+                if head[4:8] != b"ftyp":  # every mp4 starts with a size field then 'ftyp'
+                    raise ValueError("HeyGen video download is not an mp4 file")
+                if confine:
+                    output_path = validate_heygen_output_path(output_path, overwrite=overwrite)
+                os.chmod(tmp, 0o644)  # mkstemp creates 0600; keep the usual mode for a media file
+                if overwrite:
+                    os.replace(tmp, output_path)
+                else:
+                    _link_no_overwrite(tmp, output_path)
+                    tmp.unlink(missing_ok=True)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            return written
+        finally:
+            resp.close()
+    raise RuntimeError("Too many redirects downloading HeyGen video")
 
 
 def upload_image_fal(image_path: str) -> str:
-    """Upload a local image to fal.ai storage and return a public URL."""
+    """Upload a local image to fal.ai storage and return a public URL.
+
+    The path goes through the same checks as HeyGen uploads (validate_upload_path:
+    inside the allowed asset roots, png/jpeg/webp, at most 32 MB, magic bytes match
+    the extension), so an agent-supplied path cannot publish an arbitrary local file.
+    """
     import requests
+
+    path, content_type = validate_upload_path(image_path)
+    data_bytes = _read_validated_image(path, content_type)
 
     api_key = os.environ.get("FAL_KEY") or os.environ.get("FAL_AI_API_KEY")
     if not api_key:
         raise RuntimeError("FAL_KEY or FAL_AI_API_KEY required for image upload")
-
-    path = Path(image_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    suffix = path.suffix.lower()
-    content_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}.get(
-        suffix.lstrip("."), "image/png"
-    )
 
     # Initiate upload
     init_resp = requests.post(
@@ -386,7 +805,7 @@ def upload_image_fal(image_path: str) -> str:
     put_resp = requests.put(
         data["upload_url"],
         headers={"Content-Type": content_type},
-        data=path.read_bytes(),
+        data=data_bytes,
         timeout=60,
     )
     put_resp.raise_for_status()
@@ -394,43 +813,150 @@ def upload_image_fal(image_path: str) -> str:
     return data["file_url"]
 
 
-def upload_image_heygen(image_path: str, api_key: str) -> str:
-    """Upload a local image to HeyGen and return a public URL.
+HEYGEN_MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+_UPLOAD_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
-    Tries the v2 presigned-upload endpoint first, falls back to fal.ai storage.
+
+def _sniff_image_type(head: bytes) -> str | None:
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _root_too_broad(root: Path) -> bool:
+    """A root that is the filesystem root, the home directory, a parent of it, or has
+    fewer than three path components (for example / or /tmp) would allow almost any file."""
+    home = Path.home().resolve()
+    return len(root.parts) < 3 or root == home or home.is_relative_to(root)
+
+
+def _allowed_asset_roots() -> list[Path]:
+    """Directories that reference images may be read from and videos written to:
+    <repo>/projects, <repo>/assets and each OPENMONTAGE_ASSET_DIR entry (os.pathsep
+    separated). Resolved, so symlinks in the roots themselves are followed."""
+    repo_root = Path(__file__).resolve().parents[2]
+    roots = [(repo_root / "projects").resolve(), (repo_root / "assets").resolve()]
+    for part in os.environ.get("OPENMONTAGE_ASSET_DIR", "").split(os.pathsep):
+        if not part.strip():
+            continue
+        root = Path(part).expanduser().resolve()
+        if _root_too_broad(root):
+            logger.warning("Ignoring OPENMONTAGE_ASSET_DIR entry %s: too broad (filesystem root, home directory or a parent of it)", root)
+            continue
+        roots.append(root)
+    return roots
+
+
+def _heygen_default_output_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "projects" / "_heygen"
+
+
+class OutputPathError(ValueError):
+    """output_path is not allowed (outside the asset roots, wrong suffix, a directory, exists)."""
+
+
+def validate_heygen_output_path(output_path: str | Path, overwrite: bool = True) -> Path:
+    """Return the resolved path a HeyGen video may be written to, or raise OutputPathError.
+
+    The path must resolve (symlinks followed, so a link pointing out of the roots is
+    refused) inside the allowed asset roots, end in .mp4 and not be a directory. With
+    overwrite=False an existing file at the resolved path is refused too.
+    """
+    resolved = Path(output_path).resolve()
+    if not any(resolved.is_relative_to(root) for root in _allowed_asset_roots()):
+        raise OutputPathError(f"Refusing to write {resolved.name}: output_path is outside the project asset directory")
+    if resolved.suffix.lower() != ".mp4":
+        raise OutputPathError(f"Refusing to write {resolved.name}: output_path must end in .mp4")
+    if resolved.is_dir():
+        raise OutputPathError(f"Refusing to write {resolved.name}: output_path is a directory")
+    if not overwrite and resolved.exists():
+        raise OutputPathError(
+            f"Refusing to overwrite existing {resolved.name}: output_path already exists "
+            "(pass overwrite=true to replace it, or choose another path)"
+        )
+    return resolved
+
+
+def validate_heygen_upload_path(image_path: str) -> tuple[Path, str]:
+    """Return (resolved path, content type) for an image that may be uploaded.
+
+    The path must resolve (symlinks followed) inside <repo>/projects, <repo>/assets
+    or OPENMONTAGE_ASSET_DIR. It must be a png, jpeg or webp of at most 32 MB whose
+    magic bytes match its extension; the content type comes from the magic bytes.
+    """
+    resolved = Path(image_path).resolve()
+    if not any(resolved.is_relative_to(root) for root in _allowed_asset_roots()):
+        raise ValueError(f"Refusing to upload {resolved.name}: outside the project asset directory")
+    if not resolved.is_file():  # after the roots check, so this is not a file-exists oracle
+        raise FileNotFoundError(f"Image not found: {image_path}")
+    expected = _UPLOAD_IMAGE_TYPES.get(resolved.suffix.lower())
+    if not expected:
+        raise ValueError(f"Refusing to upload {resolved.name}: only png, jpg, jpeg and webp images are allowed")
+    size = resolved.stat().st_size
+    if size == 0 or size > HEYGEN_MAX_UPLOAD_BYTES:
+        raise ValueError(f"Refusing to upload {resolved.name}: size must be 1 to {HEYGEN_MAX_UPLOAD_BYTES} bytes")
+    with resolved.open("rb") as fh:
+        content_type = _sniff_image_type(fh.read(16))
+    if content_type != expected:
+        raise ValueError(f"Refusing to upload {resolved.name}: file content does not match its extension")
+    return resolved, content_type
+
+
+validate_upload_path = validate_heygen_upload_path  # generic name for non-HeyGen callers
+
+
+def _read_validated_image(path: Path, content_type: str) -> bytes:
+    """Read the file once and re-check size and magic bytes on the bytes that are sent,
+    so a file swapped or grown after validate_upload_path is not uploaded."""
+    data = path.read_bytes()
+    if not data or len(data) > HEYGEN_MAX_UPLOAD_BYTES or _sniff_image_type(data[:16]) != content_type:
+        raise ValueError(f"Refusing to upload {path.name}: file changed during validation")
+    return data
+
+
+def upload_image_heygen(image_path: str, api_key: str) -> dict[str, str]:
+    """Upload a local image with POST /v3/assets (multipart) and return a v3
+    asset input ({"type": "asset_id", "asset_id": ...}).
+
+    Replaces POST /v2/assets/upload (retired Oct 31, 2026). The path is checked
+    by validate_heygen_upload_path first. If the HeyGen upload fails the image is
+    NOT sent to public fal.ai storage unless HEYGEN_ALLOW_FAL_FALLBACK=1; the
+    fallback is logged as a warning.
     """
     import requests
 
-    path = Path(image_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
+    path, content_type = validate_heygen_upload_path(image_path)
 
-    # Try HeyGen v2 presigned upload
+    data = _read_validated_image(path, content_type)
     try:
         resp = requests.post(
-            "https://api.heygen.com/v2/assets/upload",
-            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-            json={"content_type": "image/png", "file_name": path.name},
-            timeout=30,
+            f"{HEYGEN_API_BASE}/v3/assets",
+            headers={"X-Api-Key": api_key},
+            files={"file": (path.name, data, content_type)},
+            timeout=60,
         )
-        if resp.status_code == 200:
-            data = resp.json().get("data", {})
-            upload_url = data.get("upload_url")
-            file_url = data.get("url") or data.get("file_url")
-            if upload_url and file_url:
-                put_resp = requests.put(
-                    upload_url,
-                    headers={"Content-Type": "image/png"},
-                    data=path.read_bytes(),
-                    timeout=60,
-                )
-                put_resp.raise_for_status()
-                return file_url
-    except Exception:
-        pass
+        asset_id = resp.json().get("data", {}).get("asset_id") if resp.status_code in (200, 201) else None
+        failure = "no asset_id in response" if resp.status_code in (200, 201) else f"HTTP {resp.status_code}"
+    except Exception as exc:
+        asset_id, failure = None, type(exc).__name__
+    if asset_id:
+        return {"type": "asset_id", "asset_id": asset_id}
 
-    # Fallback to fal.ai storage upload
-    return upload_image_fal(image_path)
+    if os.environ.get("HEYGEN_ALLOW_FAL_FALLBACK") != "1":
+        raise RuntimeError(
+            f"HeyGen asset upload failed ({failure}). The public fal.ai fallback is off; "
+            "set HEYGEN_ALLOW_FAL_FALLBACK=1 to allow it."
+        )
+    logger.warning(
+        "HeyGen asset upload failed (%s); uploading %s to public fal.ai storage (HEYGEN_ALLOW_FAL_FALLBACK=1)",
+        failure,
+        path.name,
+    )
+    return {"type": "url", "url": upload_image_fal(str(path))}
 
 
 def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
@@ -440,7 +966,16 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     if not api_key:
         return ToolResult(success=False, error="HEYGEN_API_KEY not set.")
 
-    provider = inputs.get("provider_variant", "veo_3_1")
+    provider = inputs.get("provider_variant", HEYGEN_DEFAULT_PROVIDER)
+    if provider in HEYGEN_LEGACY_PROVIDERS:
+        return ToolResult(
+            success=False,
+            error=(
+                f"provider_variant {provider} used the HeyGen v1 workflows API, which HeyGen retires on "
+                f"Oct 31, 2026, and has no documented v3 equivalent. Use {HEYGEN_DEFAULT_PROVIDER} "
+                "(POST /v3/models/videos) or another video tool."
+            ),
+        )
     if provider not in HEYGEN_PROVIDERS:
         return ToolResult(
             success=False,
@@ -450,41 +985,125 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
     prompt = inputs["prompt"]
     aspect_ratio = inputs.get("aspect_ratio", "16:9")
     operation = inputs.get("operation", "text_to_video")
-    workflow_input: dict[str, Any] = {
-        "prompt": prompt,
-        "provider": provider,
-        "aspect_ratio": aspect_ratio,
-    }
-    if operation == "image_to_video":
-        ref_url = inputs.get("reference_image_url")
-        ref_path = inputs.get("reference_image_path")
-        if ref_path and not ref_url:
-            ref_url = upload_image_heygen(ref_path, api_key)
-        if not ref_url:
-            return ToolResult(
-                success=False,
-                error="image_to_video requires reference_image_url or reference_image_path",
-            )
-        workflow_input["reference_image_url"] = ref_url
+    if operation not in ("text_to_video", "image_to_video"):
+        return ToolResult(success=False, error=f"Unsupported operation: {operation}")
+    if operation == "text_to_video" and inputs.get("resolution") in ("1080p", "2k") and aspect_ratio not in ("16:9", "9:16"):
+        return ToolResult(
+            success=False,
+            error=f"HeyGen renders {inputs['resolution']} only in 16:9 or 9:16 for text_to_video, not {aspect_ratio}",
+        )
 
-    response = requests.post(
-        "https://api.heygen.com/v1/workflows/executions",
-        headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-        json={"workflow_type": "GenerateVideoNode", "input": workflow_input},
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    execution_id = payload.get("data", {}).get("execution_id")
-    if not execution_id:
-        return ToolResult(success=False, error=f"No execution_id in response: {payload}")
+    ref_url = inputs.get("reference_image_url")
+    if operation == "image_to_video" and ref_url and not (
+        isinstance(ref_url, str) and len(ref_url) <= 2048 and _reference_url_ok(ref_url)
+    ):
+        return ToolResult(
+            success=False,
+            error=(
+                "reference_image_url must be a plain https URL of at most 2048 characters to a public "
+                "DNS name (no IP address, localhost, userinfo, port, fragment, or token/key/signature "
+                "query parameters). For a private image use reference_image_path, which uploads it to HeyGen."
+            ),
+        )
 
-    video_url = poll_heygen(execution_id, api_key, timeout=600)
-    output_path = Path(inputs.get("output_path", f"heygen_video_{execution_id}.mp4"))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    download = requests.get(video_url, timeout=120)
-    download.raise_for_status()
-    output_path.write_bytes(download.content)
+    # Confine the output file before anything is created or billed.
+    # An explicit output_path is never overwritten unless overwrite=true; the default name
+    # contains the video id, so re-downloading the same video to it is harmless.
+    custom_output = inputs.get("output_path")
+    overwrite = not custom_output or inputs.get("overwrite") is True
+    try:
+        output_path = validate_heygen_output_path(custom_output, overwrite=overwrite) if custom_output else None
+    except OutputPathError as exc:
+        return ToolResult(success=False, error=str(exc))
+
+    # Resume: a job saved for the same request is polled instead of creating (and
+    # billing) a new video. The saved Idempotency-Key also makes a retry after a
+    # timed-out create return the original response.
+    job_key = heygen_idempotency_key(inputs)
+    with _heygen_job_lock(job_key):
+        job = _load_heygen_job(job_key)
+        if job is None:
+            job = {"idempotency_key": uuid.uuid4().hex, "created_at": time.time()}
+            _save_heygen_job(job_key, job)
+        resumed = "video_id" in job
+
+        if resumed:
+            video_id = job["video_id"]
+        else:
+            body: dict[str, Any] = {"model": HEYGEN_V3_MODEL, "mode": operation, "prompt": prompt}
+            if "duration" in inputs:
+                body["duration"] = int(inputs["duration"])
+            if "resolution" in inputs:
+                body["resolution"] = inputs["resolution"]
+            if operation == "image_to_video":
+                ref_url = inputs.get("reference_image_url")
+                ref_path = inputs.get("reference_image_path")
+                if ref_url:
+                    image = {"type": "url", "url": ref_url}
+                elif ref_path:
+                    image = upload_image_heygen(ref_path, api_key)
+                else:
+                    return ToolResult(
+                        success=False,
+                        error="image_to_video requires reference_image_url or reference_image_path",
+                    )
+                body["image"] = image  # image_to_video follows the first frame; no aspect_ratio
+            else:
+                body["aspect_ratio"] = aspect_ratio
+
+            try:
+                response = requests.post(
+                    f"{HEYGEN_API_BASE}/v3/models/videos",
+                    headers={
+                        "X-Api-Key": api_key,
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": job["idempotency_key"],
+                    },
+                    json=body,
+                    timeout=30,
+                )
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                # A 4xx (not 409) means HeyGen rejected the request, so nothing was billed:
+                # drop the saved key. A timeout or 5xx may have been accepted: keep it.
+                code = getattr(exc.response, "status_code", 0) or 0
+                if 400 <= code < 500 and code != 409:
+                    _clear_heygen_job(job_key)
+                raise
+            payload = response.json()
+            video_id = payload.get("data", {}).get("video_id")
+            if not video_id:
+                return ToolResult(success=False, error="No video_id in HeyGen v3 response")
+            try:
+                validate_heygen_video_id(video_id)  # before the poll URL and the file name
+            except ValueError as exc:
+                return ToolResult(success=False, error=str(exc))
+            job["video_id"] = video_id
+            _save_heygen_job(job_key, job)  # before polling, so a re-run resumes this id
+    execution_id = video_id  # kept as a result field name for callers
+
+    try:
+        video_url = poll_heygen(execution_id, api_key, timeout=600)
+    except HeyGenJobFailed:
+        _clear_heygen_job(job_key)  # a failed job is not resumable; the next run starts fresh
+        raise
+    except requests.HTTPError as exc:
+        if resumed and getattr(exc.response, "status_code", 0) == 404:
+            _clear_heygen_job(job_key)
+            raise RuntimeError(
+                f"Saved HeyGen job {execution_id} no longer exists; cleared it, run again to start a new generation"
+            ) from exc
+        raise
+    if output_path is None:
+        output_path = validate_heygen_output_path(_heygen_default_output_dir() / f"heygen_video_{execution_id}.mp4")
+    # Polling can take up to 10 minutes: check the destination again right before downloading
+    # (and download_heygen_video checks once more just before the rename). The video id stays
+    # saved, so after fixing the path a re-run downloads it without creating a new video.
+    try:
+        output_path = validate_heygen_output_path(output_path, overwrite=overwrite)
+        download_heygen_video(video_url, output_path, confine=True, overwrite=overwrite)
+    except OutputPathError as exc:
+        return ToolResult(success=False, error=f"{exc}. The HeyGen video {execution_id} is kept; re-run to download it")
 
     meta = HEYGEN_PROVIDERS[provider]
     return ToolResult(
@@ -498,6 +1117,7 @@ def generate_heygen_video(inputs: dict[str, Any]) -> ToolResult:
             "aspect_ratio": aspect_ratio,
             "operation": operation,
             "execution_id": execution_id,
+            "resumed": resumed,
             "output": str(output_path),
             "format": "mp4",
         },
