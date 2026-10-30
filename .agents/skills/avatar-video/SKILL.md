@@ -1,8 +1,8 @@
 ---
 name: avatar-video
 description: |
-  Create AI avatar videos with precise control over avatars, voices, scripts, scenes, and backgrounds using HeyGen's v2 API. Use when: (1) Choosing a specific avatar and voice for a video, (2) Writing exact scripts for an avatar to speak, (3) Building multi-scene videos with different backgrounds per scene, (4) Creating transparent WebM videos for compositing, (5) Using talking photos as video presenters, (6) Integrating HeyGen avatars with Remotion, (7) Batch video generation with exact specs, (8) Brand-consistent production videos with precise control.
-homepage: https://docs.heygen.com/reference/create-a-video
+  Create AI avatar videos with precise control over avatars, voices, scripts, scenes, and backgrounds using HeyGen's v3 API (POST /v3/videos). Use when: (1) Choosing a specific avatar and voice for a video, (2) Writing exact scripts for an avatar to speak, (3) Building multi-scene videos with different backgrounds per scene, (4) Creating transparent WebM videos for compositing, (5) Using photo avatars as video presenters, (6) Integrating HeyGen avatars with Remotion, (7) Batch video generation with exact specs, (8) Brand-consistent production videos with precise control.
+homepage: https://developers.heygen.com/reference/create-video
 allowed-tools: mcp__heygen__*
 metadata:
   openclaw:
@@ -14,14 +14,14 @@ metadata:
 
 # Avatar Video
 
-Create AI avatar videos with full control over avatars, voices, scripts, scenes, and backgrounds. Build single or multi-scene videos with exact configuration using HeyGen's `/v2/video/generate` API.
+Create AI avatar videos with full control over avatars, voices, scripts, scenes, and backgrounds. HeyGen retires `/v2/video/generate` and `/v1/video.webm` on October 31, 2026. Build the video with `POST /v3/videos`.
 
 ## Authentication
 
 All requests require the `X-Api-Key` header. Set the `HEYGEN_API_KEY` environment variable.
 
 ```bash
-curl -X GET "https://api.heygen.com/v2/avatars" \
+curl -X GET "https://api.heygen.com/v3/avatars/looks" \
   -H "X-Api-Key: $HEYGEN_API_KEY"
 ```
 
@@ -31,19 +31,19 @@ If HeyGen MCP tools are available (`mcp__heygen__*`), **prefer them** over direc
 
 | Task | MCP Tool | Fallback (Direct API) |
 |------|----------|----------------------|
-| Check video status / get URL | `mcp__heygen__get_video` | `GET /v2/videos/{video_id}` |
-| List account videos | `mcp__heygen__list_videos` | `GET /v2/videos` |
-| Delete a video | `mcp__heygen__delete_video` | `DELETE /v2/videos/{video_id}` |
+| Check video status / get URL | `mcp__heygen__get_video` | `GET /v3/videos/{video_id}` |
+| List account videos | `mcp__heygen__list_videos` | `GET /v3/videos` |
+| Delete a video | `mcp__heygen__delete_video` | `DELETE /v3/videos/{video_id}` |
 
-Video generation (`POST /v2/video/generate`) and avatar/voice listing are done via direct API calls — see reference files below.
+Video generation (`POST /v3/videos`) and avatar/voice listing are done via direct API calls — see reference files below.
 
 ## Default Workflow
 
-1. **List avatars** — `GET /v2/avatars` → pick an avatar, preview it, note `avatar_id` and `default_voice_id`. See [avatars.md](references/avatars.md)
-2. **List voices** (if needed) — `GET /v2/voices` → pick a voice matching the avatar's gender/language. See [voices.md](references/voices.md)
+1. **List looks** — `GET /v3/avatars/looks` → pick a look. Its `id` is the `avatar_id`. See [avatars.md](references/avatars.md)
+2. **List voices** (if needed) — `GET /v3/voices`. Omit `voice_id` on create to use the avatar's default voice. See [voices.md](references/voices.md)
 3. **Write the script** — Structure scenes with one concept each. See [scripts.md](references/scripts.md)
-4. **Generate the video** — `POST /v2/video/generate` with avatar, voice, script, and background per scene. See [video-generation.md](references/video-generation.md)
-5. **Poll for completion** — `GET /v2/videos/{video_id}` until status is `completed`. See [video-status.md](references/video-status.md)
+4. **Generate the video** — `POST /v3/videos` with `type: "avatar"` (or `type: "studio"` for several scenes). See [video-generation.md](references/video-generation.md)
+5. **Poll for completion** — `GET /v3/videos/{video_id}` until status is `completed`. See [video-status.md](references/video-status.md)
 
 ## Quick Reference
 
@@ -86,7 +86,7 @@ If the user just wants to **describe a video idea** and let AI handle the rest (
 - [references/avatars.md](references/avatars.md) - Listing avatars, styles, avatar_id selection
 - [references/voices.md](references/voices.md) - Listing voices, locales, speed/pitch
 - [references/scripts.md](references/scripts.md) - Writing scripts, pauses, pacing
-- [references/video-generation.md](references/video-generation.md) - POST /v2/video/generate and multi-scene videos
+- [references/video-generation.md](references/video-generation.md) - POST /v3/videos (`type: "avatar"` or `type: "studio"`)
 
 ### Video Customization
 - [references/backgrounds.md](references/backgrounds.md) - Solid colors, images, video backgrounds

@@ -1,195 +1,52 @@
 ---
 name: quota
-description: Credit system, usage limits, and checking remaining quota for HeyGen
+description: Read HeyGen account balance with GET /v3/users/me
 ---
 
-# HeyGen Quota and Credits
+# HeyGen Account and Credits
 
-HeyGen uses a credit-based system for video generation. Understanding quota management helps prevent failed video generation requests.
-
-## Checking Remaining Quota
-
-### curl
+`GET /v2/user/remaining_quota` and `GET /v1/user/me` retire on October 31, 2026. The v3 call is:
 
 ```bash
-curl -X GET "https://api.heygen.com/v2/user/remaining_quota" \
+curl "https://api.heygen.com/v3/users/me" \
   -H "X-Api-Key: $HEYGEN_API_KEY"
 ```
 
-### TypeScript
+`data.billing_type` is `wallet`, `subscription`, or `usage_based`. Exactly one of these objects is populated:
 
-```typescript
-interface QuotaResponse {
-  error: null | string;
-  data: {
-    remaining_quota: number;
-    used_quota: number;
-  };
-}
-
-const response = await fetch("https://api.heygen.com/v2/user/remaining_quota", {
-  headers: { "X-Api-Key": process.env.HEYGEN_API_KEY! },
-});
-
-const { data }: QuotaResponse = await response.json();
-console.log(`Remaining credits: ${data.remaining_quota}`);
-```
-
-### Python
+| `billing_type` | Where remaining usage lives |
+|----------------|-----------------------------|
+| `wallet` | `data.wallet.remaining_balance` (USD or credits) plus `data.wallet.currency` |
+| `subscription` | `data.subscription.plan` and `data.subscription.credits` (`premium_credits.remaining`, `add_on_credits.remaining`, each with `resets_at`) |
+| `usage_based` | `data.usage_based.remaining_credits`, `spending_current_usd`, `spending_cap_usd` |
 
 ```python
-import requests
 import os
+import requests
+
+def remaining(profile: dict) -> str:
+    data = profile["data"]
+    kind = data.get("billing_type")
+    if kind == "wallet" and data.get("wallet"):
+        wallet = data["wallet"]
+        return f"{wallet.get('remaining_balance')} {wallet.get('currency')}"
+    if kind == "subscription" and data.get("subscription"):
+        credits = data["subscription"]["credits"]
+        premium = (credits.get("premium_credits") or {}).get("remaining")
+        return f"{premium} premium credits"
+    if kind == "usage_based" and data.get("usage_based"):
+        return f"{data['usage_based'].get('remaining_credits')} credits"
+    return "unknown"
 
 response = requests.get(
-    "https://api.heygen.com/v2/user/remaining_quota",
-    headers={"X-Api-Key": os.environ["HEYGEN_API_KEY"]}
+    "https://api.heygen.com/v3/users/me",
+    headers={"X-Api-Key": os.environ["HEYGEN_API_KEY"]},
+    timeout=30,
 )
-
-data = response.json()["data"]
-print(f"Remaining credits: {data['remaining_quota']}")
+response.raise_for_status()
+print(remaining(response.json()))
 ```
 
-## Response Format
+There is no confirmed v3 "test mode" that replaces the old quota test flag. Draft by using a short script or a 5-second `heygen-video-1` clip, not a retired query parameter.
 
-```json
-{
-  "error": null,
-  "data": {
-    "remaining_quota": 450,
-    "used_quota": 50
-  }
-}
-```
-
-## Credit Consumption
-
-Different operations consume different amounts of credits:
-
-| Operation | Credit Cost | Notes |
-|-----------|-------------|-------|
-| Standard video (1 min) | ~1 credit per minute | Varies by resolution |
-| 720p video | Base rate | Standard quality |
-| 1080p video | ~1.5x base rate | Higher quality |
-| Video translation | Varies | Depends on video length |
-| Streaming avatar | Per session | Real-time usage |
-
-## Pre-Generation Quota Check
-
-Always verify sufficient quota before generating videos:
-
-```typescript
-async function generateVideoWithQuotaCheck(videoConfig: VideoConfig) {
-  // Check quota first
-  const quotaResponse = await fetch(
-    "https://api.heygen.com/v2/user/remaining_quota",
-    { headers: { "X-Api-Key": process.env.HEYGEN_API_KEY! } }
-  );
-
-  const { data: quota } = await quotaResponse.json();
-
-  // Estimate required credits (rough estimate: 1 credit per minute)
-  const estimatedMinutes = videoConfig.estimatedDuration / 60;
-  const requiredCredits = Math.ceil(estimatedMinutes);
-
-  if (quota.remaining_quota < requiredCredits) {
-    throw new Error(
-      `Insufficient credits. Need ${requiredCredits}, have ${quota.remaining_quota}`
-    );
-  }
-
-  // Proceed with video generation
-  return generateVideo(videoConfig);
-}
-```
-
-## Quota Management Best Practices
-
-### 1. Monitor Usage Regularly
-
-```typescript
-async function logQuotaUsage() {
-  const response = await fetch(
-    "https://api.heygen.com/v2/user/remaining_quota",
-    { headers: { "X-Api-Key": process.env.HEYGEN_API_KEY! } }
-  );
-
-  const { data } = await response.json();
-
-  console.log({
-    remaining: data.remaining_quota,
-    used: data.used_quota,
-    percentUsed: (
-      (data.used_quota / (data.remaining_quota + data.used_quota)) *
-      100
-    ).toFixed(1),
-  });
-}
-```
-
-### 2. Set Up Alerts
-
-```typescript
-const QUOTA_WARNING_THRESHOLD = 50;
-
-async function checkQuotaWithAlert() {
-  const response = await fetch(
-    "https://api.heygen.com/v2/user/remaining_quota",
-    { headers: { "X-Api-Key": process.env.HEYGEN_API_KEY! } }
-  );
-
-  const { data } = await response.json();
-
-  if (data.remaining_quota < QUOTA_WARNING_THRESHOLD) {
-    // Send alert (email, Slack, etc.)
-    await sendAlert(`Low HeyGen quota: ${data.remaining_quota} credits remaining`);
-  }
-
-  return data;
-}
-```
-
-### 3. Use Test Mode for Development
-
-When available, use test mode to avoid consuming credits during development:
-
-```typescript
-const videoConfig = {
-  test: true, // Use test mode during development
-  video_inputs: [...],
-};
-
-// Test videos may have watermarks but don't consume credits
-```
-
-## Subscription Tiers
-
-Different subscription tiers have different quota allocations and features:
-
-| Tier | Features |
-|------|----------|
-| Free | Limited credits, basic features |
-| Creator | More credits, standard avatars |
-| Team | Higher limits, team collaboration |
-| Enterprise | Custom limits, API access, priority support |
-
-API access typically requires Enterprise tier or higher.
-
-## Error Handling for Quota Issues
-
-```typescript
-async function handleQuotaError(error: any) {
-  if (error.message.includes("quota") || error.message.includes("credit")) {
-    console.error("Quota exceeded. Consider:");
-    console.error("1. Upgrading your subscription");
-    console.error("2. Waiting for quota reset");
-    console.error("3. Purchasing additional credits");
-
-    // Check current quota
-    const quota = await getQuota();
-    console.error(`Current remaining: ${quota.remaining_quota}`);
-  }
-
-  throw error;
-}
-```
+A `401` is an auth failure. A `429` with `error.code` of `rate_limit_exceeded` is a burst limit (`Retry-After`). `quota_exceeded` or HTTP 402 is an allowance limit. Read `error.message` rather than assuming the balance shape.

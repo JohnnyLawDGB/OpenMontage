@@ -2,7 +2,7 @@
 name: heygen
 description: |
   [DEPRECATED] Use `create-video` for prompt-based video generation or `avatar-video` for precise avatar/scene control. This legacy skill combines both workflows — the newer focused skills provide clearer guidance.
-homepage: https://docs.heygen.com/reference/generate-video-agent
+homepage: https://developers.heygen.com/reference/create-video-agent-session
 allowed-tools: mcp__heygen__*
 metadata:
   openclaw:
@@ -16,7 +16,7 @@ metadata:
 
 > **This skill is deprecated.** Use the focused skills instead:
 > - **`create-video`** — Generate videos from a text prompt (Video Agent API)
-> - **`avatar-video`** — Build videos with specific avatars, voices, scripts, and scenes (v2 API)
+> - **`avatar-video`** — Build videos with specific avatars, voices, scripts, and scenes (`POST /v3/videos`)
 
 This skill remains for backward compatibility but will be removed in a future release.
 
@@ -30,10 +30,10 @@ If HeyGen MCP tools are available (`mcp__heygen__*`), **prefer them** over direc
 
 | Task | MCP Tool | Fallback (Direct API) |
 |------|----------|----------------------|
-| Generate video from prompt | `mcp__heygen__generate_video_agent` | `POST /v1/video_agent/generate` |
-| Check video status / get URL | `mcp__heygen__get_video` | `GET /v2/videos/{video_id}` |
-| List account videos | `mcp__heygen__list_videos` | `GET /v2/videos` |
-| Delete a video | `mcp__heygen__delete_video` | `DELETE /v2/videos/{video_id}` |
+| Generate video from prompt | `mcp__heygen__generate_video_agent` | `POST /v3/video-agents` |
+| Check video status / get URL | `mcp__heygen__get_video` | `GET /v3/videos/{video_id}` |
+| List account videos | `mcp__heygen__list_videos` | `GET /v3/videos` |
+| Delete a video | `mcp__heygen__delete_video` | `DELETE /v3/videos/{video_id}` |
 
 If no HeyGen MCP tools are available, use direct HTTP API calls with `X-Api-Key: $HEYGEN_API_KEY` header as documented in the reference files.
 
@@ -44,15 +44,17 @@ Always use [prompt-optimizer.md](references/prompt-optimizer.md) guidelines to s
 
 **With MCP tools:**
 1. Write an optimized prompt using [prompt-optimizer.md](references/prompt-optimizer.md) → [visual-styles.md](references/visual-styles.md)
-2. Call `mcp__heygen__generate_video_agent` with prompt and config (duration_sec, orientation, avatar_id)
+2. Call `mcp__heygen__generate_video_agent` with the prompt. Optional v3 fields are `orientation` (`landscape` or `portrait`), `avatar_id`, and `voice_id`. There is no `config.duration_sec`.
 3. Call `mcp__heygen__get_video` with the returned video_id to poll status and get the download URL
 
 **Without MCP tools (direct API):**
 1. Write an optimized prompt using [prompt-optimizer.md](references/prompt-optimizer.md) → [visual-styles.md](references/visual-styles.md)
-2. `POST /v1/video_agent/generate` — see [video-agent.md](references/video-agent.md)
-3. `GET /v2/videos/<id>` — see [video-status.md](references/video-status.md)
+2. `POST /v3/video-agents` — see [video-agent.md](references/video-agent.md)
+3. `GET /v3/videos/<id>` — see [video-status.md](references/video-status.md)
 
-Only use v2/video/generate when user explicitly needs:
+HeyGen retires v1 and v2 REST on October 31, 2026. Do not call `/v1/video_agent/generate` or `/v2/video/generate`.
+
+Only use `POST /v3/videos` when the user explicitly needs:
 - Exact script without AI modification
 - Specific voice_id selection
 - Different avatars/backgrounds per scene
@@ -82,7 +84,7 @@ Only use v2/video/generate when user explicitly needs:
 - [references/avatars.md](references/avatars.md) - Listing avatars, styles, avatar_id selection
 - [references/voices.md](references/voices.md) - Listing voices, locales, speed/pitch
 - [references/scripts.md](references/scripts.md) - Writing scripts, pauses, pacing
-- [references/video-generation.md](references/video-generation.md) - POST /v2/video/generate and multi-scene videos
+- [references/video-generation.md](references/video-generation.md) - POST /v3/videos (`type: "avatar"` or `type: "studio"`)
 - [references/video-agent.md](references/video-agent.md) - One-shot prompt video generation
 - [references/prompt-optimizer.md](references/prompt-optimizer.md) - Writing effective Video Agent prompts (core workflow + rules)
 - [references/visual-styles.md](references/visual-styles.md) - 20 named visual styles with full specs

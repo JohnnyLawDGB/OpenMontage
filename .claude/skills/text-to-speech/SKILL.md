@@ -1,7 +1,7 @@
 ---
 name: text-to-speech
 description: |
-  Generate speech audio from text using HeyGen's Starfish TTS model. Use when: (1) Generating standalone speech audio files from text, (2) Converting text to speech with voice selection, speed, and pitch control, (3) Creating audio for voiceovers, narration, or podcasts, (4) Working with HeyGen's /v1/audio endpoints, (5) Listing available TTS voices by language or gender.
+  Generate speech audio from text using HeyGen. Use when: (1) Generating standalone speech audio files from text, (2) Converting text to speech with voice selection and speed control, (3) Creating audio for voiceovers, narration, or podcasts, (4) Working with HeyGen POST /v3/voices/speech or POST /v3/models/audio/tts, (5) Listing voices with GET /v3/voices.
 allowed-tools: mcp__heygen__*
 metadata:
   openclaw:
@@ -11,356 +11,94 @@ metadata:
     primaryEnv: HEYGEN_API_KEY
 ---
 
-# Text-to-Speech (HeyGen Starfish)
+# Text-to-Speech (HeyGen)
 
-Generate speech audio files from text using HeyGen's in-house Starfish TTS model. This skill is for standalone audio generation — separate from video creation.
+Generate a standalone audio file from text. HeyGen retires `GET /v1/audio/voices`, `GET /v2/voices`, and `POST /v1/audio/text_to_speech` on October 31, 2026.
+
+Prefer the HeyGen MCP (`list_voices`, `create_speech`) when it is connected. The REST calls below are the confirmed v3 replacements.
+
+Catalog and designed voices, including Starfish:
+
+- `GET https://api.heygen.com/v3/voices`
+- `POST https://api.heygen.com/v3/voices/speech`
+
+HeyGen Voice clones (instant or professional) speak through a different route, `POST /v3/models/audio/tts`. Filter the catalog with `GET /v3/voices?engine=starfish` when you need a Starfish voice. Each voice reports `available_engines` and `default_engine`.
 
 ## Authentication
 
-All requests require the `X-Api-Key` header. Set the `HEYGEN_API_KEY` environment variable.
+Send `X-Api-Key: $HEYGEN_API_KEY` on every request.
+
+## List voices
 
 ```bash
-curl -X GET "https://api.heygen.com/v1/audio/voices" \
+curl "https://api.heygen.com/v3/voices?engine=starfish" \
   -H "X-Api-Key: $HEYGEN_API_KEY"
 ```
 
-## Tool Selection
+Confirmed query filters: `engine` (`orca`, `starfish`, `elevenlabs`), `language`, `gender`, and `type`. Pagination is cursor-based (`has_more`, `next_token`). Check `support_pause` before inserting break tags.
 
-If HeyGen MCP tools are available (`mcp__heygen__*`), **prefer them** over direct HTTP API calls.
+`GET /v1/audio/voices` and `GET /v2/voices` are the same v3 list. There is no longer a separate audio-voices host path.
 
-| Task | MCP Tool | Fallback (Direct API) |
-|------|----------|----------------------|
-| List TTS voices | `mcp__heygen__list_audio_voices` | `GET /v1/audio/voices` |
-| Generate speech audio | `mcp__heygen__text_to_speech` | `POST /v1/audio/text_to_speech` |
+## Generate speech
 
-## Default Workflow
+`POST https://api.heygen.com/v3/voices/speech`
 
-1. List voices with `mcp__heygen__list_audio_voices` (or `GET /v1/audio/voices`)
-2. Pick a voice matching desired language, gender, and features
-3. Call `mcp__heygen__text_to_speech` (or `POST /v1/audio/text_to_speech`) with text and voice_id
-4. Use the returned `audio_url` to download or play the audio
+| Field | Required | Notes |
+|-------|:--------:|-------|
+| `text` | yes | 1–5,000 characters |
+| `voice_id` | yes | From `GET /v3/voices` |
+| `engine` | no | `orca` (HeyGen Voice catalog), `starfish`, or `elevenlabs`. Omit to use the voice default. |
+| `speed` | no | 0.5–2.0, default 1.0 |
+| `language` | no | Base code such as `en`. Auto-detected when omitted. |
+| `locale` | no | BCP-47 tag such as `en-US`. Overrides `language`. Starfish uses `locale`. |
+| `settings.model_id` | no | ElevenLabs only. Confirmed ids include `eleven_v4`, `eleven_v3`, `eleven_multilingual_v2`, `eleven_flash_v2`, `eleven_flash_v2_5`, `eleven_turbo_v2_5`. |
+| `force_regenerate` | no | Skip the speech cache |
 
-## List TTS Voices
-
-Retrieve voices compatible with the Starfish TTS model.
-
-> **Note:** This uses `GET /v1/audio/voices` — a different endpoint from the video voices API (`GET /v2/voices`). Not all video voices support Starfish TTS.
-
-### curl
+Pitch is not a confirmed field on this endpoint. Avatar video requests accept `voice_settings.pitch` on `POST /v3/videos` instead.
 
 ```bash
-curl -X GET "https://api.heygen.com/v1/audio/voices" \
-  -H "X-Api-Key: $HEYGEN_API_KEY"
-```
-
-### TypeScript
-
-```typescript
-interface TTSVoice {
-  voice_id: string;
-  language: string;
-  gender: "female" | "male" | "unknown";
-  name: string;
-  preview_audio_url: string | null;
-  support_pause: boolean;
-  support_locale: boolean;
-  type: string;
-}
-
-interface TTSVoicesResponse {
-  error: null | string;
-  data: {
-    voices: TTSVoice[];
-  };
-}
-
-async function listTTSVoices(): Promise<TTSVoice[]> {
-  const response = await fetch("https://api.heygen.com/v1/audio/voices", {
-    headers: { "X-Api-Key": process.env.HEYGEN_API_KEY! },
-  });
-
-  const json: TTSVoicesResponse = await response.json();
-
-  if (json.error) {
-    throw new Error(json.error);
-  }
-
-  return json.data.voices;
-}
-```
-
-### Python
-
-```python
-import requests
-import os
-
-def list_tts_voices() -> list:
-    response = requests.get(
-        "https://api.heygen.com/v1/audio/voices",
-        headers={"X-Api-Key": os.environ["HEYGEN_API_KEY"]}
-    )
-
-    data = response.json()
-    if data.get("error"):
-        raise Exception(data["error"])
-
-    return data["data"]["voices"]
-```
-
-### Response Format
-
-```json
-{
-  "error": null,
-  "data": {
-    "voices": [
-      {
-        "voice_id": "f38a635bee7a4d1f9b0a654a31d050d2",
-        "name": "Chill Brian",
-        "language": "English",
-        "gender": "male",
-        "preview_audio_url": "https://resource.heygen.ai/text_to_speech/WpSDQvmLGXEqXZVZQiVeg6.mp3",
-        "support_pause": true,
-        "support_locale": false,
-        "type": "public"
-      }
-    ]
-  }
-}
-```
-
-## Generate Speech Audio
-
-Convert text to speech audio using a specified voice.
-
-### Endpoint
-
-`POST https://api.heygen.com/v1/audio/text_to_speech`
-
-### Request Fields
-
-| Field | Type | Req | Description |
-|-------|------|:---:|-------------|
-| `text` | string | Y | Text content to convert to speech |
-| `voice_id` | string | Y | Voice ID from `GET /v1/audio/voices` |
-| `speed` | number | | Speech speed, 0.5-1.5 (default: 1) |
-| `pitch` | integer | | Voice pitch, -50 to 50 (default: 0) |
-| `locale` | string | | Accent/locale for multilingual voices (e.g., `en-US`, `pt-BR`) |
-| `elevenlabs_settings` | object | | Advanced settings for ElevenLabs voices |
-
-### ElevenLabs Settings (optional)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | string | Model selection (`eleven_v3`, `eleven_turbo_v2_5`, etc.) |
-| `similarity_boost` | number | Voice similarity, 0.0-1.0 |
-| `stability` | number | Output consistency, 0.0-1.0 |
-| `style` | number | Style intensity, 0.0-1.0 |
-
-### curl
-
-```bash
-curl -X POST "https://api.heygen.com/v1/audio/text_to_speech" \
+curl -X POST "https://api.heygen.com/v3/voices/speech" \
   -H "X-Api-Key: $HEYGEN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "Hello! Welcome to our product demo.",
-    "voice_id": "YOUR_VOICE_ID",
+    "text": "Hello from HeyGen. <break time=\"1s\"/> Let us get started.",
+    "voice_id": "VOICE_ID",
+    "engine": "starfish",
+    "locale": "en-US",
     "speed": 1.0
   }'
 ```
 
-### TypeScript
-
-```typescript
-interface TTSRequest {
-  text: string;
-  voice_id: string;
-  speed?: number;
-  pitch?: number;
-  locale?: string;
-  elevenlabs_settings?: {
-    model?: string;
-    similarity_boost?: number;
-    stability?: number;
-    style?: number;
-  };
-}
-
-interface WordTimestamp {
-  word: string;
-  start: number;
-  end: number;
-}
-
-interface TTSResponse {
-  error: null | string;
-  data: {
-    audio_url: string;
-    duration: number;
-    request_id: string;
-    word_timestamps: WordTimestamp[];
-  };
-}
-
-async function textToSpeech(request: TTSRequest): Promise<TTSResponse["data"]> {
-  const response = await fetch(
-    "https://api.heygen.com/v1/audio/text_to_speech",
-    {
-      method: "POST",
-      headers: {
-        "X-Api-Key": process.env.HEYGEN_API_KEY!,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(request),
-    }
-  );
-
-  const json: TTSResponse = await response.json();
-
-  if (json.error) {
-    throw new Error(json.error);
-  }
-
-  return json.data;
-}
-```
-
-### Python
-
-```python
-import requests
-import os
-
-def text_to_speech(
-    text: str,
-    voice_id: str,
-    speed: float = 1.0,
-    pitch: int = 0,
-    locale: str | None = None,
-) -> dict:
-    payload = {
-        "text": text,
-        "voice_id": voice_id,
-        "speed": speed,
-        "pitch": pitch,
-    }
-
-    if locale:
-        payload["locale"] = locale
-
-    response = requests.post(
-        "https://api.heygen.com/v1/audio/text_to_speech",
-        headers={
-            "X-Api-Key": os.environ["HEYGEN_API_KEY"],
-            "Content-Type": "application/json",
-        },
-        json=payload,
-    )
-
-    data = response.json()
-    if data.get("error"):
-        raise Exception(data["error"])
-
-    return data["data"]
-```
-
-### Response Format
-
 ```json
 {
-  "error": null,
   "data": {
-    "audio_url": "https://resource2.heygen.ai/text_to_speech/.../id=365d46bb.wav",
-    "duration": 5.526,
-    "request_id": "p38QJ52hfgNlsYKZZmd9",
-    "word_timestamps": [
-      { "word": "<start>", "start": 0.0, "end": 0.0 },
-      { "word": "Hey", "start": 0.079, "end": 0.219 },
-      { "word": "there,", "start": 0.239, "end": 0.459 },
-      { "word": "<end>", "start": 5.526, "end": 5.526 }
-    ]
+    "audio_url": "https://files.heygen.ai/audio/req_xyz789.mp3",
+    "duration": 2.4,
+    "engine": "starfish",
+    "request_id": "req_xyz789"
   }
 }
 ```
 
-## Usage Examples
+`word_timestamps` is included when the engine returns them. `<break time="1s"/>` is the only markup to put in `text`. The same tag works inside `script` on `POST /v3/videos`.
 
-### Basic TTS
+```python
+import os
+import requests
 
-```typescript
-const result = await textToSpeech({
-  text: "Welcome to our quarterly earnings call.",
-  voice_id: "YOUR_VOICE_ID",
-});
-
-console.log(`Audio URL: ${result.audio_url}`);
-console.log(`Duration: ${result.duration}s`);
+def synthesize(text: str, voice_id: str) -> str:
+    response = requests.post(
+        "https://api.heygen.com/v3/voices/speech",
+        headers={"X-Api-Key": os.environ["HEYGEN_API_KEY"]},
+        json={"text": text, "voice_id": voice_id, "engine": "starfish"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["data"]["audio_url"]
 ```
 
-### With Speed Adjustment
+A `400` means the voice, plan, or language cannot use the requested engine. Read `available_engines` and pick another. A `403` with `ai_vendor_access_restricted` means a workspace admin has blocked ElevenLabs.
 
-```typescript
-const result = await textToSpeech({
-  text: "We're thrilled to announce our newest feature!",
-  voice_id: "YOUR_VOICE_ID",
-  speed: 1.1,
-});
-```
+## HeyGen Voice clones
 
-### With Locale for Multilingual Voices
-
-```typescript
-const result = await textToSpeech({
-  text: "Bem-vindo ao nosso produto.",
-  voice_id: "MULTILINGUAL_VOICE_ID",
-  locale: "pt-BR",
-});
-```
-
-### Find a Voice and Generate Audio
-
-```typescript
-async function generateSpeech(text: string, language: string): Promise<string> {
-  const voices = await listTTSVoices();
-  const voice = voices.find(
-    (v) => v.language.toLowerCase().includes(language.toLowerCase())
-  );
-
-  if (!voice) {
-    throw new Error(`No TTS voice found for language: ${language}`);
-  }
-
-  const result = await textToSpeech({
-    text,
-    voice_id: voice.voice_id,
-  });
-
-  return result.audio_url;
-}
-
-const audioUrl = await generateSpeech("Hello and welcome!", "english");
-```
-
-## Pauses with Break Tags
-
-Use SSML-style break tags in your text for pauses:
-
-```
-word <break time="1s"/> word
-```
-
-Rules:
-- Use seconds with `s` suffix: `<break time="1.5s"/>`
-- Must have spaces before and after the tag
-- Self-closing tag format
-
-## Best Practices
-
-1. **Use `GET /v1/audio/voices`** to find compatible voices — not all voices from `GET /v2/voices` support Starfish TTS
-2. **Check `support_locale`** before setting a `locale` — only multilingual voices support locale selection
-3. **Keep speed between 0.8-1.2** for natural-sounding output
-4. **Preview voices** using the `preview_audio_url` before generating (may be null for some voices)
-5. **Use `word_timestamps`** in the response for caption syncing or timed text overlays
-6. **Use SSML break tags** in your text for pauses: `word <break time="1s"/> word`
+Instant and professional clones are not spoken with `POST /v3/voices/speech`. HeyGen documents `POST /v3/models/audio/tts` (and `/v3/models/audio/tts/stream`) for those voices, and `GET /v3/models/audio/voices` to list them. This repo's video tool does not call the speech routes. If MCP `create_speech` is available, use that and let it select the engine.

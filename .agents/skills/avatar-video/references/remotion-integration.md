@@ -10,21 +10,21 @@ This guide covers workflows for generating HeyGen avatar videos and using them i
 ## Quick Start
 
 ```typescript
-// 1. Get avatar with default voice
-const avatar = await getAvatarDetails(avatarId);
-
-// 2. Generate video (MP4 with background - most common)
+// 1. Pick a look. Its id is avatar_id. Omit voice_id to use the avatar default.
+// 2. POST /v3/videos (v1/v2 generate and /v1/video.webm retire 2026-10-31)
 const videoId = await generateVideo({
-  video_inputs: [{
-    character: { type: "avatar", avatar_id: avatar.id, avatar_style: "normal" },
-    voice: { type: "text", input_text: script, voice_id: avatar.default_voice_id },
-    background: { type: "color", value: "#1a1a2e" },
-  }],
-  dimension: { width: 1920, height: 1080 },
+  type: "avatar",
+  avatar_id: avatarId,
+  script,
+  voice_id: voiceId,
+  aspect_ratio: "16:9",
+  resolution: "1080p",
+  output_format: "mp4",
+  background: { type: "color", value: "#1a1a2e" },
 });
 
-// 3. Poll for completion (10-15+ min)
-// 4. Use in Remotion with motion graphics overlaid on top
+// 3. Poll GET /v3/videos/{video_id}
+// 4. Use the MP4 in Remotion with motion graphics overlaid on top
 ```
 
 ## Overview
@@ -40,13 +40,13 @@ A typical workflow:
 | Your Composition | Recommended | Why |
 |------------------|-------------|-----|
 | Avatar as presenter with overlays | MP4 + background | Simpler, overlays go on top |
-| Loom-style (avatar over screen recording) | WebM + `closeUp`, mask in Remotion | Need transparency, apply circle mask in CSS |
+| Loom-style (avatar over screen recording) | WebM, circle mask in Remotion | Need transparency, apply circle mask in CSS |
 | Avatar overlaid ON other video/content | WebM (transparent) | Need to see through to content behind |
 | Full-screen avatar | MP4 + background | Standard approach |
 
 **Use MP4 with background for most cases.** Use WebM when you need to see content *behind* the avatar.
 
-**Note:** WebM only supports `normal` and `closeUp` styles. For circular framing, use CSS `border-radius: 50%` in Remotion.
+**Note:** v3 has no `closeUp` or `circle` avatar style. For a circular talking head, render WebM (`output_format: "webm"`) and apply CSS `border-radius: 50%` in Remotion. Optional framing on the API is `fit`: `cover` or `contain`.
 
 ## Recommended: Parallel Development Workflow
 
@@ -91,34 +91,26 @@ async function generateHeyGenVideo(
   voiceId: string,
   preset: DimensionPreset
 ): Promise<string> {
-  const dimension = DIMENSIONS[preset];
+  const aspectRatio = preset.includes("portrait") || preset.includes("9")
+    ? "9:16"
+    : preset.includes("square")
+      ? "1:1"
+      : "16:9";
 
-  const response = await fetch("https://api.heygen.com/v2/video/generate", {
+  const response = await fetch("https://api.heygen.com/v3/videos", {
     method: "POST",
     headers: {
       "X-Api-Key": process.env.HEYGEN_API_KEY!,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      video_inputs: [
-        {
-          character: {
-            type: "avatar",
-            avatar_id: avatarId,
-            avatar_style: "normal",
-          },
-          voice: {
-            type: "text",
-            input_text: script,
-            voice_id: voiceId,
-          },
-          background: {
-            type: "color",
-            value: "#00FF00", // Green screen for compositing
-          },
-        },
-      ],
-      dimension,
+      type: "avatar",
+      avatar_id: avatarId,
+      script,
+      voice_id: voiceId,
+      aspect_ratio: aspectRatio,
+      resolution: "1080p",
+      background: { type: "color", value: "#00FF00" },
     }),
   });
 
@@ -170,36 +162,27 @@ async function generateAvatarForRemotion(
   avatarId: string,
   voiceId: string,
   options: {
-    style?: "normal" | "closeUp" | "circle";
     backgroundColor?: string;
+    fit?: "cover" | "contain";
   } = {}
 ): Promise<string> {
-  const { style = "normal", backgroundColor = "#1a1a2e" } = options;
+  const { backgroundColor = "#1a1a2e", fit } = options;
 
-  const response = await fetch("https://api.heygen.com/v2/video/generate", {
+  const response = await fetch("https://api.heygen.com/v3/videos", {
     method: "POST",
     headers: {
       "X-Api-Key": process.env.HEYGEN_API_KEY!,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      video_inputs: [{
-        character: {
-          type: "avatar",
-          avatar_id: avatarId,
-          avatar_style: style,
-        },
-        voice: {
-          type: "text",
-          input_text: script,
-          voice_id: voiceId,
-        },
-        background: {
-          type: "color",
-          value: backgroundColor,
-        },
-      }],
-      dimension: { width: 1920, height: 1080 },
+      type: "avatar",
+      avatar_id: avatarId,
+      script,
+      voice_id: voiceId,
+      aspect_ratio: "16:9",
+      resolution: "1080p",
+      fit,
+      background: { type: "color", value: backgroundColor },
     }),
   });
 
@@ -213,20 +196,22 @@ async function generateAvatarForRemotion(
 Only use when you need to see content *behind* the avatar (e.g., avatar overlaid on screen recording):
 
 ```typescript
-// Use /v1/video.webm endpoint for transparent background
-// Note: Different structure than /v2/video/generate
-const response = await fetch("https://api.heygen.com/v1/video.webm", {
+// Transparent background is output_format "webm" on POST /v3/videos.
+// Do not call POST /v1/video.webm. Do not send a background together with webm.
+const response = await fetch("https://api.heygen.com/v3/videos", {
   method: "POST",
   headers: {
     "X-Api-Key": process.env.HEYGEN_API_KEY!,
     "Content-Type": "application/json",
   },
   body: JSON.stringify({
-    avatar_pose_id: avatarPoseId,  // Required: avatar pose ID
-    avatar_style: "normal",        // Required: "normal" or "closeUp" only
-    input_text: script,            // Required (with voice_id)
-    voice_id: voiceId,             // Required (with input_text)
-    dimension: { width: 1920, height: 1080 },
+    type: "avatar",
+    avatar_id: avatarId,
+    script,
+    voice_id: voiceId,
+    aspect_ratio: "16:9",
+    resolution: "1080p",
+    output_format: "webm",
   }),
 });
 ```
@@ -269,7 +254,7 @@ export const AvatarComposition: React.FC<AvatarCompositionProps> = ({
 
 ### WebM with Transparent Background (Recommended)
 
-Using WebM from `/v1/video.webm` - no chroma keying needed:
+Using WebM from `POST /v3/videos` with `output_format: "webm"` — no chroma keying needed:
 
 ```tsx
 import { OffthreadVideo, AbsoluteFill, Sequence } from "remotion";
@@ -308,14 +293,14 @@ export const AvatarWithMotionGraphics: React.FC<{
 
 ### Loom-Style: Circle Avatar Over Screen Recording
 
-Use `closeUp` style + WebM, then apply circular mask in Remotion:
+Render WebM (`output_format: "webm"`), then apply a circular mask in Remotion. v3 does not have a `closeUp` or `circle` style:
 
 ```tsx
 import { OffthreadVideo, AbsoluteFill } from "remotion";
 
 export const LoomStyleComposition: React.FC<{
   screenRecordingUrl: string;
-  avatarWebmUrl: string; // Generated with avatar_style: "closeUp" via /v1/video.webm
+  avatarWebmUrl: string; // POST /v3/videos with output_format "webm"
 }> = ({ screenRecordingUrl, avatarWebmUrl }) => {
   return (
     <AbsoluteFill>
@@ -342,7 +327,7 @@ export const LoomStyleComposition: React.FC<{
 };
 ```
 
-**Note:** WebM doesn't support `circle` style - use `normal` or `closeUp` and apply circular masking via CSS.
+**Note:** Apply the circle with CSS. Do not send `avatar_style: "circle"` — that field is v2 only.
 
 ### Legacy: Green Screen with Chroma Key
 
