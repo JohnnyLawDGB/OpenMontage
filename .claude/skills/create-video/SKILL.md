@@ -2,7 +2,7 @@
 name: create-video
 description: |
   Create videos from a text prompt using HeyGen's Video Agent. Use when: (1) Creating a video from a description or idea, (2) Generating explainer, demo, or marketing videos from a prompt, (3) Making a video without specifying exact avatars, voices, or scenes, (4) Quick video prototyping or drafts, (5) One-shot prompt-to-video generation, (6) User says "make me a video" or "create a video about X".
-homepage: https://docs.heygen.com/reference/generate-video-agent
+homepage: https://developers.heygen.com/reference/create-video-agent-session
 allowed-tools: mcp__heygen__*
 metadata:
   openclaw:
@@ -21,7 +21,7 @@ Generate complete videos from a text prompt. Describe what you want and the AI h
 All requests require the `X-Api-Key` header. Set the `HEYGEN_API_KEY` environment variable.
 
 ```bash
-curl -X POST "https://api.heygen.com/v1/video_agent/generate" \
+curl -X POST "https://api.heygen.com/v3/video-agents" \
   -H "X-Api-Key: $HEYGEN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Create a 60-second product demo video."}'
@@ -33,10 +33,10 @@ If HeyGen MCP tools are available (`mcp__heygen__*`), **prefer them** over direc
 
 | Task | MCP Tool | Fallback (Direct API) |
 |------|----------|----------------------|
-| Generate video from prompt | `mcp__heygen__generate_video_agent` | `POST /v1/video_agent/generate` |
-| Check video status / get URL | `mcp__heygen__get_video` | `GET /v2/videos/{video_id}` |
-| List account videos | `mcp__heygen__list_videos` | `GET /v2/videos` |
-| Delete a video | `mcp__heygen__delete_video` | `DELETE /v2/videos/{video_id}` |
+| Generate video from prompt | `mcp__heygen__generate_video_agent` | `POST /v3/video-agents` |
+| Check video status / get URL | `mcp__heygen__get_video` | `GET /v3/videos/{video_id}` |
+| List account videos | `mcp__heygen__list_videos` | `GET /v3/videos` |
+| Delete a video | `mcp__heygen__delete_video` | `DELETE /v3/videos/{video_id}` |
 
 If no HeyGen MCP tools are available, use direct HTTP API calls as documented in the reference files.
 
@@ -46,13 +46,15 @@ Always use [prompt-optimizer.md](references/prompt-optimizer.md) guidelines to s
 
 **With MCP tools:**
 1. Write an optimized prompt using [prompt-optimizer.md](references/prompt-optimizer.md) → [visual-styles.md](references/visual-styles.md)
-2. Call `mcp__heygen__generate_video_agent` with prompt and config (duration_sec, orientation, avatar_id)
+2. Call `mcp__heygen__generate_video_agent` with the prompt. Optional v3 fields are `orientation` (`landscape` or `portrait`), `avatar_id`, and `voice_id`. There is no `config.duration_sec`.
 3. Call `mcp__heygen__get_video` with the returned video_id to poll status and get the download URL
 
 **Without MCP tools (direct API):**
 1. Write an optimized prompt using [prompt-optimizer.md](references/prompt-optimizer.md) → [visual-styles.md](references/visual-styles.md)
-2. `POST /v1/video_agent/generate` — see [video-agent.md](references/video-agent.md)
-3. `GET /v2/videos/<id>` — see [video-status.md](references/video-status.md)
+2. `POST /v3/video-agents` — see [video-agent.md](references/video-agent.md)
+3. `GET /v3/videos/<id>` — see [video-status.md](references/video-status.md)
+
+`POST /v1/video_agent/generate` retires on October 31, 2026.
 
 ## Quick Reference
 

@@ -32,52 +32,35 @@ HeyGen supports various video dimensions and aspect ratios to fit different plat
 
 ## Setting Dimensions
 
-### TypeScript
+`POST /v2/video/generate` with `dimension: { width, height }` retires on October 31, 2026. `POST /v3/videos` takes `aspect_ratio` and `resolution`, not pixel width and height.
 
-```typescript
-// Landscape 1080p
-const landscapeConfig = {
-  video_inputs: [...],
-  dimension: {
-    width: 1920,
-    height: 1080
-  }
-};
+| `aspect_ratio` | Use |
+|----------------|-----|
+| `16:9` | YouTube, LinkedIn, landscape |
+| `9:16` | TikTok, Reels, Shorts |
+| `1:1` | Square feed |
+| `4:5`, `5:4` | Social crops |
+| `auto` | Match the avatar or image. Default in the HeyGen docs for new requests is often `16:9` unless you set `auto`. |
 
-// Portrait 1080p
-const portraitConfig = {
-  video_inputs: [...],
-  dimension: {
-    width: 1080,
-    height: 1920
-  }
-};
-
-// Square 1080p
-const squareConfig = {
-  video_inputs: [...],
-  dimension: {
-    width: 1080,
-    height: 1080
-  }
-};
-```
-
-### curl
+`resolution` on an avatar video is `720p`, `1080p`, or `4k` (`4k` only for Avatar III digital twins and studio avatars). `4:3` is not a confirmed `aspect_ratio`.
 
 ```bash
-# Landscape 1080p
-curl -X POST "https://api.heygen.com/v2/video/generate" \
+curl -X POST "https://api.heygen.com/v3/videos" \
   -H "X-Api-Key: $HEYGEN_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "video_inputs": [...],
-    "dimension": {
-      "width": 1920,
-      "height": 1080
-    }
+    "type": "avatar",
+    "avatar_id": "LOOK_ID",
+    "script": "Hello.",
+    "voice_id": "VOICE_ID",
+    "aspect_ratio": "16:9",
+    "resolution": "1080p"
   }'
 ```
+
+Pixel width and height still matter for Remotion compositions and for `POST /v3/templates/{template_id}`, which accepts `dimension: { width, height }` (even numbers, 128–4096, same aspect ratio as the template). The tables above are for that compositor, not for `POST /v3/videos`.
+
+`heygen-video-1` (`POST /v3/models/videos`) uses `aspect_ratio` `16:9`, `9:16`, or `1:1` and `resolution` `480p`, `768p`, `1080p`, or `2k`. That is a different enum from avatar videos.
 
 ## Dimension Helper Functions
 
@@ -127,87 +110,49 @@ const instagramDimensions = getDimensions("1:1", "1080p");
 
 ### YouTube
 
-```typescript
-const youtubeConfig = {
-  video_inputs: [...],
-  dimension: { width: 1920, height: 1080 }, // 16:9 landscape
-};
+```json
+{ "type": "avatar", "aspect_ratio": "16:9", "resolution": "1080p" }
 ```
 
 ### TikTok / Instagram Reels / YouTube Shorts
 
-```typescript
-const shortFormConfig = {
-  video_inputs: [...],
-  dimension: { width: 1080, height: 1920 }, // 9:16 portrait
-};
+```json
+{ "type": "avatar", "aspect_ratio": "9:16", "resolution": "1080p" }
 ```
 
 ### Instagram Feed Post
 
-```typescript
-const instagramFeedConfig = {
-  video_inputs: [...],
-  dimension: { width: 1080, height: 1080 }, // 1:1 square
-};
+```json
+{ "type": "avatar", "aspect_ratio": "1:1", "resolution": "1080p" }
 ```
 
 ### LinkedIn
 
-```typescript
-const linkedinConfig = {
-  video_inputs: [...],
-  dimension: { width: 1920, height: 1080 }, // 16:9 landscape preferred
-};
+```json
+{ "type": "avatar", "aspect_ratio": "16:9", "resolution": "1080p" }
 ```
 
 ### Twitter/X
 
-```typescript
-const twitterConfig = {
-  video_inputs: [...],
-  dimension: { width: 1280, height: 720 }, // 16:9, 720p is common
-};
+```json
+{ "type": "avatar", "aspect_ratio": "16:9", "resolution": "720p" }
 ```
 
-## Avatar IV Dimensions
+## Avatar IV
 
-For Avatar IV (photo-based avatars), dimensions are set via orientation:
+Avatar IV is the default engine on `POST /v3/videos` when `engine` is omitted. It uses the same `aspect_ratio` and `resolution` fields as any other avatar video. Photo avatars should prefer `aspect_ratio: "auto"` so the frame follows the still.
 
-```typescript
-type VideoOrientation = "portrait" | "landscape" | "square";
+Video Agent orientation is `landscape` or `portrait` on `POST /v3/video-agents`, not a pixel size.
 
-function getAvatarIVDimensions(orientation: VideoOrientation): Dimensions {
-  switch (orientation) {
-    case "portrait":
-      return { width: 720, height: 1280 };
-    case "landscape":
-      return { width: 1280, height: 720 };
-    case "square":
-      return { width: 720, height: 720 };
-  }
-}
-```
+## Custom pixel sizes
 
-## Custom Dimensions
+Arbitrary width and height are confirmed on `POST /v3/templates/{template_id}` only:
 
-HeyGen supports custom dimensions within limits:
+- Minimum 128px on a side, maximum 4096px
+- Both sides even
+- Must keep the template's aspect ratio
 
-```typescript
-const customConfig = {
-  video_inputs: [...],
-  dimension: {
-    width: 1600,
-    height: 900  // Custom 16:9 at non-standard resolution
-  }
-};
-```
-
-### Dimension Constraints
-
-- **Minimum**: 128px on any side
-- **Maximum**: 4096px on any side
-- **Must be even numbers**: Both width and height must be divisible by 2
+`POST /v3/videos` will reject a `dimension` object. Do not send one.
 
 ```typescript
 function validateDimensions(width: number, height: number): boolean {
@@ -224,36 +169,21 @@ function validateDimensions(width: number, height: number): boolean {
 }
 ```
 
-## Resolution vs. Credit Cost
+## Resolution
 
-Higher resolutions may consume more credits:
-
-| Resolution | Relative Cost |
-|------------|---------------|
-| 720p | Base rate |
-| 1080p | ~1.5x base rate |
-
-Consider using 720p for drafts and testing, then 1080p for final output.
+`720p` is enough for a draft. `1080p` is the usual delivery size. Credit cost depends on the account. Read the balance with `GET /v3/users/me` (see [quota.md](quota.md)) instead of assuming a fixed multiplier.
 
 ## Background Considerations
 
 Match background image/video dimensions to your video dimensions:
 
-```typescript
-// For 1080p landscape video
-const config = {
-  video_inputs: [
-    {
-      character: {...},
-      voice: {...},
-      background: {
-        type: "image",
-        url: "https://example.com/1920x1080-background.jpg" // Match video dimensions
-      }
-    }
-  ],
-  dimension: { width: 1920, height: 1080 }
-};
+```json
+{
+  "type": "avatar",
+  "aspect_ratio": "16:9",
+  "resolution": "1080p",
+  "background": { "type": "image", "url": "https://example.com/1920x1080-background.jpg" }
+}
 ```
 
 ## Creating a Video Config Factory
@@ -268,38 +198,21 @@ interface VideoConfigOptions {
 }
 
 function createVideoConfig(options: VideoConfigOptions) {
-  const platformDimensions: Record<string, Dimensions> = {
-    youtube: { width: 1920, height: 1080 },
-    tiktok: { width: 1080, height: 1920 },
-    instagram_feed: { width: 1080, height: 1080 },
-    instagram_story: { width: 1080, height: 1920 },
-    linkedin: { width: 1920, height: 1080 },
+  const aspectRatio: Record<string, "16:9" | "9:16" | "1:1"> = {
+    youtube: "16:9",
+    tiktok: "9:16",
+    instagram_feed: "1:1",
+    instagram_story: "9:16",
+    linkedin: "16:9",
   };
 
-  const dimension = platformDimensions[options.platform];
-
-  // Scale down for 720p if requested
-  if (options.quality === "720p") {
-    dimension.width = Math.round((dimension.width * 720) / 1080);
-    dimension.height = Math.round((dimension.height * 720) / 1080);
-  }
-
   return {
-    video_inputs: [
-      {
-        character: {
-          type: "avatar",
-          avatar_id: options.avatarId,
-          avatar_style: "normal",
-        },
-        voice: {
-          type: "text",
-          input_text: options.script,
-          voice_id: options.voiceId,
-        },
-      },
-    ],
-    dimension,
+    type: "avatar" as const,
+    avatar_id: options.avatarId,
+    voice_id: options.voiceId,
+    script: options.script,
+    aspect_ratio: aspectRatio[options.platform],
+    resolution: options.quality ?? "1080p",
   };
 }
 

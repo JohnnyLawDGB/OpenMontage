@@ -1,339 +1,72 @@
 ---
 name: assets
-description: Uploading images, videos, and audio for use in HeyGen video generation
+description: Upload images, audio, and video for HeyGen v3 requests
 ---
 
-# Asset Upload and Management
+# Asset Upload
 
-HeyGen allows you to upload custom assets (images, videos, audio) for use in video generation, such as backgrounds, talking photo sources, and custom audio.
+HeyGen retires `POST https://upload.heygen.com/v1/asset` on October 31, 2026. That call returned an `image_key`. v3 returns an `asset_id`.
 
-## Upload Flow
+Prefer the HeyGen MCP asset tools when they are connected. Otherwise:
 
-Asset uploads are a single-step process: POST the raw file binary directly to the upload endpoint. The Content-Type header must match the file's MIME type.
+## Upload a file (32 MB or smaller)
 
-## Uploading an Asset
-
-**Endpoint:** `POST https://upload.heygen.com/v1/asset`
-
-### Request
-
-| Header | Required | Description |
-|--------|:--------:|-------------|
-| `X-Api-Key` | ✓ | Your HeyGen API key |
-| `Content-Type` | ✓ | MIME type of the file (e.g. `image/jpeg`) |
-
-The request body is the raw binary file data. No JSON or form fields are needed.
-
-### Response
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `code` | number | Status code (`100` = success) |
-| `data.id` | string | Unique asset ID for use in video generation |
-| `data.name` | string | Asset name |
-| `data.file_type` | string | `image`, `video`, or `audio` |
-| `data.url` | string | Accessible URL for the uploaded file |
-| `data.image_key` | string \| null | Key for creating uploaded photo avatars (images only) |
-| `data.folder_id` | string | Folder ID (empty if not in a folder) |
-| `data.meta` | string \| null | Asset metadata |
-| `data.created_ts` | number | Unix timestamp of creation |
-
-### curl
+`POST https://api.heygen.com/v3/assets` as `multipart/form-data`. The form field name is `file`.
 
 ```bash
-curl -X POST "https://upload.heygen.com/v1/asset" \
+curl -X POST "https://api.heygen.com/v3/assets" \
   -H "X-Api-Key: $HEYGEN_API_KEY" \
-  -H "Content-Type: image/jpeg" \
-  --data-binary '@./background.jpg'
+  -F "file=@./portrait.png"
 ```
 
-### TypeScript
-
-```typescript
-import fs from "fs";
-import path from "path";
-
-interface AssetUploadResponse {
-  code: number;
-  data: {
-    id: string;
-    name: string;
-    file_type: string;
-    url: string;
-    image_key: string | null;
-    folder_id: string;
-    meta: string | null;
-    created_ts: number;
-  };
-  msg: string | null;
-  message: string | null;
-}
-
-async function uploadAsset(filePath: string, contentType: string): Promise<AssetUploadResponse["data"]> {
-  const resolvedPath = path.resolve(filePath);
-  const fileBuffer = fs.readFileSync(resolvedPath);
-
-  const response = await fetch("https://upload.heygen.com/v1/asset", {
-    method: "POST",
-    headers: {
-      "X-Api-Key": process.env.HEYGEN_API_KEY!,
-      "Content-Type": contentType,
-    },
-    body: fileBuffer,
-  });
-
-  const json: AssetUploadResponse = await response.json();
-
-  if (json.code !== 100) {
-    throw new Error(json.message ?? "Upload failed");
+```json
+{
+  "data": {
+    "asset_id": "asset_abc123",
+    "url": "https://files.heygen.ai/assets/asset_abc123.png",
+    "mime_type": "image/png",
+    "size_bytes": 245760
   }
-
-  return json.data;
-}
-
-// Usage
-const asset = await uploadAsset("./background.jpg", "image/jpeg");
-console.log(`Uploaded asset: ${asset.id}`);
-console.log(`Asset URL: ${asset.url}`);
-```
-
-### TypeScript (with streams for large files)
-
-```typescript
-import fs from "fs";
-import path from "path";
-import { stat } from "fs/promises";
-
-async function uploadLargeAsset(filePath: string, contentType: string): Promise<AssetUploadResponse["data"]> {
-  const resolvedPath = path.resolve(filePath);
-  const fileStats = await stat(resolvedPath);
-  const fileStream = fs.createReadStream(resolvedPath);
-
-  const response = await fetch("https://upload.heygen.com/v1/asset", {
-    method: "POST",
-    headers: {
-      "X-Api-Key": process.env.HEYGEN_API_KEY!,
-      "Content-Type": contentType,
-      "Content-Length": fileStats.size.toString(),
-    },
-    body: fileStream as any,
-    // @ts-ignore - duplex is needed for streaming
-    duplex: "half",
-  });
-
-  const json: AssetUploadResponse = await response.json();
-
-  if (json.code !== 100) {
-    throw new Error(json.message ?? "Upload failed");
-  }
-
-  return json.data;
 }
 ```
 
-### Python
+Confirmed types for this call: png, jpeg, mp4, webm, mp3, wav, pdf. This repo's `upload_image_heygen` sends png, jpeg, or webp to the same endpoint for `heygen-video-1` image-to-video. Webp is accepted by that tool; HeyGen's upload guide lists png and jpeg for images.
 
 ```python
-import requests
 import os
+import requests
 
-def upload_asset(file_path: str, content_type: str) -> dict:
-    with open(file_path, "rb") as f:
-        response = requests.post(
-            "https://upload.heygen.com/v1/asset",
-            headers={
-                "X-Api-Key": os.environ["HEYGEN_API_KEY"],
-                "Content-Type": content_type
-            },
-            data=f
-        )
-
-    data = response.json()
-    if data.get("code") != 100:
-        raise Exception(data.get("message", "Upload failed"))
-
-    return data["data"]
-
-
-# Usage
-asset = upload_asset("./background.jpg", "image/jpeg")
-print(f"Uploaded asset: {asset['id']}")
-print(f"Asset URL: {asset['url']}")
+with open("portrait.png", "rb") as handle:
+    response = requests.post(
+        "https://api.heygen.com/v3/assets",
+        headers={"X-Api-Key": os.environ["HEYGEN_API_KEY"]},
+        files={"file": ("portrait.png", handle, "image/png")},
+        timeout=60,
+    )
+response.raise_for_status()
+asset_id = response.json()["data"]["asset_id"]
 ```
 
-## Supported Content Types
+## Larger files
 
-| Type | Content-Type | Use Case |
-|------|--------------|----------|
-| JPEG | `image/jpeg` | Backgrounds, talking photos |
-| PNG | `image/png` | Backgrounds, overlays |
-| MP4 | `video/mp4` | Video backgrounds |
-| WebM | `video/webm` | Video backgrounds |
-| MP3 | `audio/mpeg` | Custom audio input |
-| WAV | `audio/wav` | Custom audio input |
+Files over 32 MB use direct upload (up to 200 MB for video, image, PDF, and zip; 1.5 GB for audio):
 
-## Uploading from URL
+1. `POST /v3/assets/direct-uploads` with `filename`, `content_type`, and `size_bytes`.
+2. `PUT` the raw bytes to `upload_url` with every header in `upload_headers`.
+3. `POST /v3/assets/{asset_id}/complete`.
 
-If your asset is already hosted online:
+The `asset_id` is usable after step 3. Delete with `DELETE /v3/assets/{asset_id}`.
 
-```typescript
-async function uploadFromUrl(sourceUrl: string, contentType: string): Promise<AssetUploadResponse["data"]> {
-  // 1. Validate and download the file
-  const url = new URL(sourceUrl);
-  if (url.protocol !== "https:") {
-    throw new Error("Only HTTPS URLs are supported");
-  }
-  const sourceResponse = await fetch(sourceUrl);
-  const buffer = Buffer.from(await sourceResponse.arrayBuffer());
+## Use the asset
 
-  // 2. Upload directly to HeyGen
-  const response = await fetch("https://upload.heygen.com/v1/asset", {
-    method: "POST",
-    headers: {
-      "X-Api-Key": process.env.HEYGEN_API_KEY!,
-      "Content-Type": contentType,
-    },
-    body: buffer,
-  });
+Pass a discriminated object. Do not send `image_key`.
 
-  const json: AssetUploadResponse = await response.json();
+| Where | Shape |
+|-------|--------|
+| Video Agent `files[]` | `{ "type": "asset_id", "asset_id": "..." }` |
+| `POST /v3/models/videos` image-to-video `image` | `{ "type": "asset_id", "asset_id": "..." }` |
+| Avatar video background | `{ "type": "image", "asset_id": "..." }` |
+| Photo avatar `file` | `{ "type": "asset_id", "asset_id": "..." }` |
+| Avatar video lip-sync audio | top-level `audio_asset_id` (mutually exclusive with `script`) |
 
-  if (json.code !== 100) {
-    throw new Error(json.message ?? "Upload failed");
-  }
-
-  return json.data;
-}
-```
-
-## Using Uploaded Assets
-
-### As Background Image
-
-```typescript
-const videoConfig = {
-  video_inputs: [
-    {
-      character: {
-        type: "avatar",
-        avatar_id: "josh_lite3_20230714",
-        avatar_style: "normal",
-      },
-      voice: {
-        type: "text",
-        input_text: "Hello, this is a video with a custom background!",
-        voice_id: "1bd001e7e50f421d891986aad5158bc8",
-      },
-      background: {
-        type: "image",
-        url: asset.url,  // Use the URL from the upload response
-      },
-    },
-  ],
-};
-```
-
-### As Talking Photo Source
-
-```typescript
-const talkingPhotoConfig = {
-  video_inputs: [
-    {
-      character: {
-        type: "talking_photo",
-        talking_photo_id: asset.id,  // Use the ID from the upload response
-      },
-      voice: {
-        type: "text",
-        input_text: "Hello from my talking photo!",
-        voice_id: "1bd001e7e50f421d891986aad5158bc8",
-      },
-    },
-  ],
-};
-```
-
-### As Audio Input
-
-```typescript
-const audioConfig = {
-  video_inputs: [
-    {
-      character: {
-        type: "avatar",
-        avatar_id: "josh_lite3_20230714",
-        avatar_style: "normal",
-      },
-      voice: {
-        type: "audio",
-        audio_url: asset.url,  // Use the URL from the upload response
-      },
-    },
-  ],
-};
-```
-
-## Complete Upload Workflow
-
-```typescript
-async function createVideoWithCustomBackground(
-  backgroundPath: string,
-  script: string
-): Promise<string> {
-  // 1. Upload background
-  console.log("Uploading background...");
-  const background = await uploadAsset(backgroundPath, "image/jpeg");
-
-  // 2. Create video config
-  const config = {
-    video_inputs: [
-      {
-        character: {
-          type: "avatar",
-          avatar_id: "josh_lite3_20230714",
-          avatar_style: "normal",
-        },
-        voice: {
-          type: "text",
-          input_text: script,
-          voice_id: "1bd001e7e50f421d891986aad5158bc8",
-        },
-        background: {
-          type: "image",
-          url: background.url,
-        },
-      },
-    ],
-    dimension: { width: 1920, height: 1080 },
-  };
-
-  // 3. Generate video
-  console.log("Generating video...");
-  const response = await fetch("https://api.heygen.com/v2/video/generate", {
-    method: "POST",
-    headers: {
-      "X-Api-Key": process.env.HEYGEN_API_KEY!,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(config),
-  });
-
-  const { data } = await response.json();
-  return data.video_id;
-}
-```
-
-## Asset Limitations
-
-- **File size**: 10MB maximum
-- **Image dimensions**: Recommended to match video dimensions
-- **Audio duration**: Should match expected video length
-- **Retention**: Assets may be deleted after a period of inactivity
-
-## Best Practices
-
-1. **Optimize images** - Resize to match video dimensions before uploading
-2. **Use appropriate formats** - JPEG for photos, PNG for graphics with transparency
-3. **Validate before upload** - Check file type and size locally first
-4. **Handle upload errors** - Implement retry logic for failed uploads
-5. **Cache asset IDs** - Reuse assets across multiple video generations
+Public HTTPS URLs use `{ "type": "url", "url": "..." }` and skip the upload. URL images are capped at 16 MB; URL video, audio, and PDF at 32 MB.

@@ -243,32 +243,37 @@ const script3 = "Welcome to HeyGen (hey-jen)...";
 
 When splitting scripts across scenes (for different backgrounds or avatars):
 
-```typescript
-const multiSceneVideo = {
-  video_inputs: [
+```json
+{
+  "type": "studio",
+  "aspect_ratio": "16:9",
+  "resolution": "1080p",
+  "scenes": [
     {
-      // Scene 1: Introduction
-      character: { type: "avatar", avatar_id: "josh_lite3_20230714", avatar_style: "normal" },
-      voice: {
-        type: "text",
-        input_text: "Welcome to our quarterly update. <break time=\"1s\"/> I'm Josh, and I'll walk you through the highlights.",
-        voice_id: "voice_id_here",
-      },
-      background: { type: "color", value: "#1a1a2e" },
+      "type": "avatar_video",
+      "input": {
+        "type": "avatar",
+        "avatar_id": "LOOK_ID",
+        "voice_id": "VOICE_ID",
+        "script": "Welcome to our quarterly update. <break time=\"1s\"/> I'll walk you through the highlights.",
+        "background": { "type": "color", "color": "#1a1a2e" }
+      }
     },
     {
-      // Scene 2: Main content (different background)
-      character: { type: "avatar", avatar_id: "josh_lite3_20230714", avatar_style: "normal" },
-      voice: {
-        type: "text",
-        input_text: "Let's start with revenue. <break time=\"0.5s\"/> We grew 25 percent quarter over quarter. <break time=\"1s\"/> Here's what drove that growth.",
-        voice_id: "voice_id_here",
-      },
-      background: { type: "image", url: "https://..." },
-    },
-    // ... more scenes
-  ],
-};
+      "type": "avatar_video",
+      "input": {
+        "type": "avatar",
+        "avatar_id": "LOOK_ID",
+        "voice_id": "VOICE_ID",
+        "script": "Let's start with revenue. <break time=\"0.5s\"/> We grew 25 percent quarter over quarter.",
+        "background": {
+          "type": "image",
+          "source": { "type": "url", "url": "https://example.com/chart.png" }
+        }
+      }
+    }
+  ]
+}
 ```
 
 ### Scene Transition Tips
@@ -288,27 +293,27 @@ Before generating the full video:
 4. **Preview with short clip** - Generate a 10-second test if unsure about pronunciation
 
 ```typescript
-// Test a small portion first
-const testScript = script.split('.').slice(0, 2).join('.') + '.';
 const testVideoId = await generateVideo({
-  video_inputs: [{
-    character: { type: "avatar", avatar_id: avatarId, avatar_style: "normal" },
-    voice: { type: "text", input_text: testScript, voice_id: voiceId },
-  }],
-  dimension: { width: 1280, height: 720 }, // Lower res for test
+  type: "avatar",
+  avatar_id: avatarId,
+  voice_id: voiceId,
+  script: testScript,
+  aspect_ratio: "16:9",
+  resolution: "720p",
 });
 ```
 
 ## Voice Speed Adjustment
 
-Adjust delivery speed in the voice configuration:
+Adjust delivery speed with `voice_settings` on `POST /v3/videos`. Speed on an avatar video is 0.5–1.5 (standalone `POST /v3/voices/speech` allows 0.5–2.0).
 
-```typescript
-voice: {
-  type: "text",
-  input_text: script,
-  voice_id: "voice_id",
-  speed: 1.1,  // Slightly faster (range: 0.5 - 2.0)
+```json
+{
+  "type": "avatar",
+  "avatar_id": "LOOK_ID",
+  "voice_id": "VOICE_ID",
+  "script": "Hello.",
+  "voice_settings": { "speed": 1.1 }
 }
 ```
 
@@ -316,7 +321,7 @@ voice: {
 |-------|--------|----------|
 | 0.8-0.9 | Slower, deliberate | Complex topics, older audiences |
 | 1.0 | Normal | General use |
-| 1.1-1.2 | Slightly faster | Energetic content, younger audiences |
-| 1.3+ | Fast | Use sparingly, may reduce clarity |
+| 1.1-1.2 | Slightly faster | Energetic content |
+| 1.3-1.5 | Fast | Use sparingly. 1.5 is the avatar-video maximum. |
 
 See [voices.md](voices.md) for full voice configuration options.
